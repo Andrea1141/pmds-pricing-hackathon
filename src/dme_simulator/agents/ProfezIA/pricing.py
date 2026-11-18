@@ -38,7 +38,7 @@ class _GoodPricingState:
 
 
 class PricingStrategy:
-    """Adaptive multi-tier pricing with staircase WTP discovery, demand-heat awareness, and inventory-cover pacing."""
+    """Adaptive multi-tier pricing with staircase WTP discovery, blitz monopoly extraction, and crowding clearance."""
 
     def __init__(self) -> None:
         self._initialized: bool = False
@@ -56,20 +56,43 @@ class PricingStrategy:
     ) -> list[Listing]:
         """Return `Listing` offers for `goods_config.finished_goods`."""
         if not self._initialized or state.turn == 1:
-            self._init_turn_one(state, goods_config)
+            self._init_turn_one(state, goods_config, ctx)
         else:
             self._update_from_turn_results(state, goods_config, ctx)
 
-        # Fix #1: If a private scenario runs longer than our initial turn estimate,
-        # extend the horizon by a full +15 turns so we immediately exit endgame mode.
+        # Extend horizon to next standard checkpoint (20 -> 30 -> 40 -> 60 -> +20)
+        # if a scenario runs longer than initially estimated, and rebound anchors after a checkpoint.
         if state.turn > self._est_total_turns:
-            self._est_total_turns = state.turn + 15
+            if self._est_total_turns <= 20:
+                self._est_total_turns = 30
+            elif self._est_total_turns <= 30:
+                self._est_total_turns = 40
+            elif self._est_total_turns <= 40:
+                self._est_total_turns = 60
+            else:
+                self._est_total_turns = state.turn + 20
+            for gp in self._goods.values():
+                if gp.has_ever_sold:
+                    gp.anchor_price = max(
+                        gp.anchor_price * 1.18,
+                        gp.ema_sold_price * 1.12,
+                        gp.max_sold_price * 0.94,
+                    )
 
         remaining_turns = max(1, self._est_total_turns - state.turn + 1)
         min_prod, exp_prod, max_prod = self._estimate_current_production(
             state, goods_config, ctx
         )
         demand_heat = float(getattr(ctx, "market_demand_heat", 1.0))
+        is_crowded = bool(
+            getattr(ctx, "is_crowded_tournament", len(state.public_capital) >= 10)
+        )
+        is_blitz = bool(
+            getattr(ctx, "is_blitz_window", is_crowded and state.turn <= 6)
+        )
+        sellers_map = getattr(ctx, "competitor_sellers_by_good", {})
+        crowding_map = getattr(ctx, "crowding_ratio_by_good", {})
+        mkt_max_map = getattr(ctx, "market_max_sale_price", {})
 
         listings: list[Listing] = []
         for good in goods_config.finished_goods:
@@ -81,15 +104,42 @@ class PricingStrategy:
             expected_stock = curr_inv + exp_prod.get(good, 0)
             optimistic_stock = curr_inv + max_prod.get(good, 0)
             comp_stock = self._competitor_finished_stock(state, ctx, good)
+            comp_sellers = int(
+                sellers_map.get(good, 0 if comp_stock == 0 else 2)
+            )
+            crowding = float(crowding_map.get(good, 0.0))
 
             unit_cost = self._current_unit_cost(good, state, goods_config, ctx, gp)
             cost_floor = self._compute_cost_floor(
-                unit_cost, gp, curr_inv, remaining_turns
+                unit_cost, gp, curr_inv, remaining_turns, is_crowded
             )
 
             base_anchor = max(cost_floor, gp.anchor_price)
-            if comp_stock == 0 and gp.has_ever_sold and remaining_turns > 3 and curr_inv <= 1:
-                base_anchor = max(base_anchor, gp.ema_sold_price * 1.03)
+
+            # Objective 1: Monopoly & near-monopoly extraction during Blitz and open niches.
+            if is_crowded:
+                if (
+                    state.turn >= 2
+                    and comp_sellers <= 1
+                    and gp.zero_sale_streak == 0
+                    and curr_inv <= 3
+                    and remaining_turns > 4
+                ):
+                    if comp_sellers == 0:
+                        mono_mult = 1.14 if is_blitz else 1.10
+                    else:
+                        mono_mult = 1.09 if is_blitz else 1.06
+                    base_anchor = max(
+                        base_anchor * mono_mult,
+                        gp.ema_sold_price * mono_mult if gp.ema_sold_price > 0 else 0.0,
+                    )
+                    mkt_max = float(mkt_max_map.get(good, 0.0))
+                    if mkt_max > base_anchor:
+                        base_anchor = 0.65 * base_anchor + 0.35 * mkt_max
+            else:
+                if comp_stock == 0 and gp.has_ever_sold and remaining_turns > 3 and curr_inv <= 1:
+                    base_anchor = max(base_anchor, gp.ema_sold_price * 1.03)
+
             if demand_heat > 1.25 and gp.zero_sale_streak == 0 and curr_inv <= 2:
                 base_anchor *= min(1.06, 1.0 + 0.08 * (demand_heat - 1.20))
 
@@ -100,6 +150,10 @@ class PricingStrategy:
                 expected_stock=expected_stock,
                 optimistic_stock=optimistic_stock,
                 comp_stock=comp_stock,
+                comp_sellers=comp_sellers,
+                crowding=crowding,
+                is_crowded=is_crowded,
+                is_blitz=is_blitz,
                 base_anchor=base_anchor,
                 cost_floor=cost_floor,
                 remaining_turns=remaining_turns,
@@ -118,11 +172,14 @@ class PricingStrategy:
         return listings
 
     # ------------------------------------------------------------------
-    # Initialization & structural WTP prior (handles multi-recipe & zero-reserve)
+    # Initialization & structural WTP prior (handles multi-recipe, zero-reserve & 38-team rooms)
     # ------------------------------------------------------------------
 
     def _init_turn_one(
-        self, state: Observation, goods_config: GoodsConfig
+        self,
+        state: Observation,
+        goods_config: GoodsConfig,
+        ctx: MarketContext | None = None,
     ) -> None:
         self._initialized = True
         self._starting_capital = max(1.0, float(state.capital))
@@ -143,12 +200,17 @@ class PricingStrategy:
         else:
             self._est_total_turns = 40
 
+        is_crowded = (
+            bool(getattr(ctx, "is_crowded_tournament", False))
+            if ctx is not None
+            else (len(state.public_capital) >= 10)
+        )
+
         raw_init_costs: dict[str, float] = {}
         input_counts: dict[str, int] = {}
         for good in goods_config.finished_goods:
             rnames = self._good_to_recipes.get(good, [])
             if rnames:
-                # Fix #4.1: Use the minimum-cost recipe when multiple recipes produce `good`.
                 best_c = float("inf")
                 best_u = 1
                 for rname in rnames:
@@ -173,7 +235,6 @@ class PricingStrategy:
             else 2.0
         )
         max_raw_cost = max(raw_init_costs.values()) if raw_init_costs else 0.0
-        # Fix #4.2: Detect nominal/zero-reserve scenarios (both single-good and multi-good).
         nominal_cost_regime = max_raw_cost < self._starting_capital * 0.002
 
         eff_costs: dict[str, float] = {}
@@ -184,7 +245,6 @@ class PricingStrategy:
                 if num_finished == 1:
                     eff_costs[good] = max(rc, self._starting_capital * 0.0052)
                 else:
-                    # Scale synthetic base cost by input complexity and starting capital.
                     eff_costs[good] = max(
                         rc,
                         (self._starting_capital * 0.0045) * (iu / max(1.0, avg_units)),
@@ -207,7 +267,10 @@ class PricingStrategy:
                 r_cost = (ecost - c_min) / max(1e-6, c_max - c_min)
                 r_units = (iunits - u_min) / max(1e-6, float(u_max - u_min))
                 r_tier = 0.72 * r_cost + 0.28 * r_units if not nominal_cost_regime else r_units
-                mult = 5.3 + 10.6 * (r_tier ** 1.2)
+                if is_crowded:
+                    mult = 5.0 + 5.6 * (r_tier ** 1.15)
+                else:
+                    mult = 5.3 + 10.6 * (r_tier ** 1.2)
                 anchor = ecost * mult
             else:
                 if nominal_cost_regime:
@@ -229,7 +292,7 @@ class PricingStrategy:
             )
 
     # ------------------------------------------------------------------
-    # Turn-over-turn learning from realized sales, demand heat & inventory cover
+    # Turn-over-turn learning from realized sales, demand heat & crowding
     # ------------------------------------------------------------------
 
     def _update_from_turn_results(
@@ -257,6 +320,11 @@ class PricingStrategy:
 
         prev_remaining_turns = max(1, self._est_total_turns - (state.turn - 1) + 1)
         demand_heat = float(getattr(ctx, "market_demand_heat", 1.0))
+        is_crowded = bool(
+            getattr(ctx, "is_crowded_tournament", len(state.public_capital) >= 10)
+        )
+        sellers_map = getattr(ctx, "competitor_sellers_by_good", {})
+        crowding_map = getattr(ctx, "crowding_ratio_by_good", {})
 
         for good in goods_config.finished_goods:
             gp = self._goods.get(good)
@@ -296,7 +364,6 @@ class PricingStrategy:
                         active_offered += off
             active_offered = max(1, active_offered)
 
-            # Inventory cover: how many turns of sales are currently sitting on shelf.
             inventory_cover = curr_inv / max(0.5, gp.ema_sales)
             target_velocity = max(
                 1.0,
@@ -304,13 +371,18 @@ class PricingStrategy:
             )
 
             curr_comp_stock = self._competitor_finished_stock(state, ctx, good)
-            # Distinguish one-time Turn-1 competitor initial dump from persistent rival supply.
+            comp_sellers = int(sellers_map.get(good, 0 if curr_comp_stock == 0 else 2))
+            crowding = float(crowding_map.get(good, 0.0))
+
             competitor_dumped = (
                 state.turn <= 3
+                and not is_crowded
                 and gp.prev_competitor_stock >= 12
                 and curr_comp_stock < gp.prev_competitor_stock * 0.55
             )
-            high_rival_pressure = curr_comp_stock > max(2, curr_inv)
+            high_rival_pressure = curr_comp_stock > max(2, curr_inv) or (
+                is_crowded and (crowding >= 0.40 or comp_sellers >= 5)
+            )
 
             if sold_qty > 0:
                 gp.has_ever_sold = True
@@ -355,7 +427,10 @@ class PricingStrategy:
 
                 if sold_all_available:
                     gp.sold_out_streak += 1
-                    step_up = 1.075 if gp.sold_out_streak == 1 else 1.10
+                    if is_crowded and comp_sellers <= 1:
+                        step_up = 1.10 if gp.sold_out_streak == 1 else 1.13
+                    else:
+                        step_up = 1.075 if gp.sold_out_streak == 1 else 1.10
                     new_anchor = max(gp.anchor_price * 1.05, max_tx_price * step_up)
                     if gp.price_ceiling > 0:
                         gp.price_ceiling = max(gp.price_ceiling, new_anchor * 1.06)
@@ -368,19 +443,27 @@ class PricingStrategy:
                         gp.anchor_price * 1.025,
                         0.40 * gp.anchor_price + 0.60 * max_tx_price * 1.03,
                     )
+                elif is_crowded and (crowding >= 0.40 or comp_sellers >= 4) and curr_inv >= 2 and sold_qty < target_velocity:
+                    # Objective 3: Fast clearance in crowded 38-team goods before price war deepens.
+                    gp.sold_out_streak = 0
+                    ref_price = 0.45 * avg_tx_price + 0.55 * min_tx_price
+                    decay = 0.89 if crowding >= 0.45 else 0.92
+                    gp.anchor_price = min(
+                        gp.anchor_price * decay,
+                        (0.35 * gp.anchor_price + 0.65 * ref_price) * decay,
+                    )
                 elif curr_inv >= 3 and (
                     inventory_cover > 2.1 or (high_rival_pressure and sold_qty < target_velocity)
                 ):
-                    # Fix #1 & #2: High inventory cover or fierce rival supply -> step down faster.
                     gp.sold_out_streak = 0
                     ref_price = 0.50 * avg_tx_price + 0.50 * min_tx_price
                     decay = 0.92 if high_rival_pressure else 0.95
-                    if demand_heat < 0.68:
+                    if demand_heat < 0.68 and not is_crowded:
                         decay = max(decay, 0.97)
                     gp.anchor_price = (0.45 * gp.anchor_price + 0.55 * ref_price) * decay
                 elif sold_qty < 0.55 * target_velocity and not competitor_dumped:
                     gp.sold_out_streak = 0
-                    decay = 0.98 if demand_heat < 0.68 else 0.95
+                    decay = 0.98 if (demand_heat < 0.68 and not is_crowded) else (0.93 if is_crowded else 0.95)
                     gp.anchor_price = (
                         0.55 * gp.anchor_price + 0.45 * avg_tx_price
                     ) * decay
@@ -395,27 +478,32 @@ class PricingStrategy:
                 gp.sold_out_streak = 0
                 if competitor_dumped:
                     gp.anchor_price *= 0.98
-                elif demand_heat < 0.65 and gp.zero_sale_streak == 0 and inventory_cover <= 2.5:
-                    # Fix #3: Market-wide demand trough (e.g. priv_wave_crash), not a bad price!
+                elif not is_crowded and demand_heat < 0.65 and gp.zero_sale_streak == 0 and inventory_cover <= 2.5:
                     gp.zero_sale_streak += 1
                     gp.anchor_price *= 0.96
                 else:
                     gp.zero_sale_streak += 1
                     if gp.has_ever_sold and gp.ema_sold_price > 0:
                         decay = 0.90 if gp.zero_sale_streak == 1 else 0.82
-                        if high_rival_pressure and inventory_cover > 2.0:
+                        if is_crowded and (crowding >= 0.40 or curr_inv >= 2):
+                            decay -= 0.05
+                        elif high_rival_pressure and inventory_cover > 2.0:
                             decay -= 0.04
                         gp.anchor_price = min(
                             gp.anchor_price * decay,
                             0.45 * gp.anchor_price + 0.55 * gp.ema_sold_price,
                         )
                     else:
-                        if gp.zero_sale_streak == 1:
-                            gp.anchor_price *= 0.82
-                        elif gp.zero_sale_streak == 2:
-                            gp.anchor_price *= 0.74
+                        if is_crowded:
+                            decay = 0.78 if gp.zero_sale_streak == 1 else (0.70 if gp.zero_sale_streak == 2 else 0.64)
+                            gp.anchor_price *= decay
                         else:
-                            gp.anchor_price *= 0.66
+                            if gp.zero_sale_streak == 1:
+                                gp.anchor_price *= 0.82
+                            elif gp.zero_sale_streak == 2:
+                                gp.anchor_price *= 0.74
+                            else:
+                                gp.anchor_price *= 0.66
 
     # ------------------------------------------------------------------
     # Staircase construction
@@ -429,6 +517,10 @@ class PricingStrategy:
         expected_stock: int,
         optimistic_stock: int,
         comp_stock: int,
+        comp_sellers: int,
+        crowding: float,
+        is_crowded: bool,
+        is_blitz: bool,
         base_anchor: float,
         cost_floor: float,
         remaining_turns: int,
@@ -441,23 +533,37 @@ class PricingStrategy:
         num_goods = max(1, len(self._goods))
         inventory_cover = curr_inv / max(0.5, gp.ema_sales)
 
-        # Fix #1: Combine inventory_cover pressure (works at any turn count, including short12)
-        # with final-turns liquidation.
         endgame_discount = 1.0
-        if remaining_turns <= 3:
+        if is_crowded and remaining_turns <= 6 and curr_inv >= 1:
+            if remaining_turns == 6 and curr_inv >= 3:
+                endgame_discount = 0.92
+            elif remaining_turns == 5 and curr_inv >= 2:
+                endgame_discount = 0.88
+            elif remaining_turns == 4:
+                endgame_discount = 0.84 if curr_inv >= 2 else 0.90
+            elif remaining_turns == 3:
+                endgame_discount = 0.78 if curr_inv >= 2 else 0.85
+            elif remaining_turns == 2:
+                endgame_discount = 0.70 if stock_to_plan > 1 else 0.80
+            elif remaining_turns == 1:
+                endgame_discount = 0.58 if stock_to_plan > 1 else 0.68
+        elif remaining_turns <= 3:
             if remaining_turns == 3 and (stock_to_plan > ceil(gp.ema_sales * 1.5) or curr_inv >= 2):
                 endgame_discount = 0.88
             elif remaining_turns == 2:
                 endgame_discount = 0.80 if stock_to_plan > 1 else 0.88
             elif remaining_turns == 1:
                 endgame_discount = 0.68 if stock_to_plan > 1 else 0.76
+        elif is_crowded and crowding >= 0.40 and curr_inv >= 2:
+            # Objective 3: Proactive clearance discount on crowded goods with shelf backlog.
+            endgame_discount = max(0.80, 0.93 - 0.03 * min(4, curr_inv))
         elif inventory_cover > 2.6 and curr_inv >= 3:
-            # Mid-game / short-horizon excess stock drain.
             endgame_discount = max(0.82, 1.0 - 0.04 * (inventory_cover - 2.2))
 
         anchor = max(cost_floor, base_anchor * endgame_discount)
         if remaining_turns == 1 and gp.ema_sold_price > 0 and num_goods > 1:
-            anchor = max(cost_floor, min(anchor, gp.ema_sold_price * 0.78))
+            cap_mult = 0.70 if is_crowded else 0.78
+            anchor = max(cost_floor, min(anchor, gp.ema_sold_price * cap_mult))
 
         ceiling = gp.price_ceiling if (gp.price_ceiling > cost_floor and remaining_turns > 1) else 0.0
         if ceiling > 0 and anchor > ceiling * 0.97:
@@ -465,8 +571,8 @@ class PricingStrategy:
 
         # Case 1: Only 1 expected unit available in Phase 3.
         if stock_to_plan == 1:
-            if gp.zero_sale_streak >= 1:
-                first_price = max(cost_floor, anchor * 0.94)
+            if gp.zero_sale_streak >= 1 or (is_crowded and crowding >= 0.40 and curr_inv == 1):
+                first_price = max(cost_floor, anchor * 0.92)
             else:
                 first_price = anchor
             probe_price = max(first_price * 1.04, anchor * 1.06)
@@ -478,37 +584,48 @@ class PricingStrategy:
             ]
 
         # Case 2: Multiple units available.
-        # Fix #2: Keep all stock active in unit/small-chunk tiers while bounding step count
-        # per good so total decision latency stays well under 10 ms.
+        # Objective 2: When `is_crowded` is True, raise `max_steps` up to `min(active_qty, 20)`
+        # (1 unit per Listing on real stock) to maximize softmax shelf share against 30+ rivals.
         active_qty = stock_to_plan
-        max_steps = 12 if num_goods == 1 else 8
-        chunk = max(1, ceil(active_qty / max_steps))
+        if is_crowded:
+            max_steps = min(active_qty, 20)
+        else:
+            max_steps = 12 if num_goods == 1 else 8
+        chunk = max(1, ceil(active_qty / max(1, max_steps)))
         tiers: list[tuple[int, float, str]] = []
 
-        # Widen staircase with a lower volume/clearance tranche ONLY when either:
-        # - We are in a single-good endowment market with rivals (`tutorial_pricing`), or
-        # - This specific good has accumulated excess shelf cover (`curr_inv >= 3` and `inventory_cover > 2.0`),
-        # so we never cannibalize scarce high-margin goods (`LAPTOP`/`PHONE` in `priv_bottleneck`).
+        # Objective 3: Include crowded-good clearance condition (`is_crowded and crowding >= 0.40 and curr_inv >= 2`).
+        crowded_clearance = is_crowded and (crowding >= 0.40 or comp_sellers >= 4) and curr_inv >= 2
         wide_multi_segment = (
-            (num_goods == 1 and gp.init_endowment >= 10 and active_qty >= 4)
+            crowded_clearance
+            or (num_goods == 1 and gp.init_endowment >= 10 and active_qty >= 4)
             or (active_qty >= 5 and comp_stock > 0)
             or (curr_inv >= 3 and inventory_cover > 2.0 and comp_stock > 0)
         )
 
         if ceiling > 0:
-            if wide_multi_segment or curr_inv >= 3:
+            if crowded_clearance:
+                step_mults = [0.78, 0.84, 0.89, 0.94, 0.98, 1.00, 1.02]
+            elif wide_multi_segment or curr_inv >= 3:
                 step_mults = [0.80, 0.86, 0.91, 0.95, 0.98, 1.00, 1.02]
             else:
                 step_mults = [0.94, 0.97, 0.99, 1.00, 1.015, 1.03]
         elif not gp.has_ever_sold and turn == 1:
             if num_goods == 1 and gp.init_endowment == 0:
                 step_mults = [0.95, 0.97, 0.99, 1.01, 1.03, 1.06]
+            elif is_crowded:
+                step_mults = [0.86, 0.92, 0.97, 1.02, 1.08, 1.15]
             elif wide_multi_segment:
                 step_mults = [0.78, 0.84, 0.90, 0.96, 1.01, 1.06, 1.12]
             else:
                 step_mults = [0.92, 0.97, 1.02, 1.07, 1.13, 1.20]
+        elif crowded_clearance:
+            step_mults = [0.78, 0.84, 0.90, 0.95, 1.00, 1.05]
         elif gp.zero_sale_streak >= 1 or (curr_inv >= 3 and inventory_cover > 2.2):
             step_mults = [0.80, 0.86, 0.91, 0.96, 1.00, 1.04]
+        elif is_crowded and comp_sellers <= 1 and is_blitz:
+            # Blitz monopoly staircase: extract full top-segment WTP.
+            step_mults = [0.98, 1.02, 1.06, 1.11, 1.16, 1.22]
         elif wide_multi_segment:
             step_mults = [0.82, 0.88, 0.94, 0.99, 1.03, 1.08, 1.14]
         else:
@@ -523,7 +640,6 @@ class PricingStrategy:
         while allocated < active_qty:
             qty = min(chunk, active_qty - allocated)
             frac = step_idx / max(1, total_steps - 1)
-            # Interpolate smoothly across `step_mults` based on `frac`.
             pos = frac * (len(step_mults) - 1)
             lo_idx = int(pos)
             hi_idx = min(lo_idx + 1, len(step_mults) - 1)
@@ -549,7 +665,7 @@ class PricingStrategy:
         return tiers
 
     # ------------------------------------------------------------------
-    # Production & cost helpers (integrated with MarketContext v2)
+    # Production & cost helpers (integrated with MarketContext v2/v3)
     # ------------------------------------------------------------------
 
     def _estimate_current_production(
@@ -566,7 +682,6 @@ class PricingStrategy:
                 cap = lot_caps.get(bid.good, bid.quantity)
                 bid_map[bid.good] = min(cap, bid_map.get(bid.good, 0) + int(bid.quantity))
 
-        # Fix #3: Read `ctx.auction_fill_rate` and `ctx.estimated_capacity_per_turn`.
         fill_map = getattr(ctx, "auction_fill_rate", {})
         inv_min = {raw: max(0, int(state.inventory.get(raw, 0))) for raw in goods_config.raw_materials}
         inv_exp = {
@@ -654,11 +769,14 @@ class PricingStrategy:
         gp: _GoodPricingState,
         curr_inv: int,
         remaining_turns: int,
+        is_crowded: bool = False,
     ) -> float:
         if remaining_turns <= 1 and curr_inv > 0:
-            return max(1.0, unit_cost * 0.60)
-        if remaining_turns == 2 and curr_inv >= 2:
-            return max(1.0, unit_cost * 0.82)
+            return max(1.0, unit_cost * (0.45 if is_crowded else 0.60))
+        if remaining_turns == 2 and curr_inv >= 1:
+            return max(1.0, unit_cost * (0.70 if is_crowded else 0.82))
+        if is_crowded and remaining_turns <= 4 and curr_inv >= 2:
+            return max(1.0, unit_cost * 0.88)
         return max(1.0, unit_cost * 1.12)
 
     @staticmethod
