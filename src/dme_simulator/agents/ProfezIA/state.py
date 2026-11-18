@@ -76,14 +76,21 @@ class MarketContext:
     competitor_finished_inventory: dict[str, int] = field(default_factory=dict)
     competitor_raw_inventory: dict[str, int] = field(default_factory=dict)
     lot_scarcity: dict[str, float] = field(default_factory=dict)
+    rival_capital_delta: dict[str, float] = field(default_factory=dict)
+    market_demand_heat: float = 1.0
 
-    # Optional downstream signal populated by production.py for future coordination.
+    # Downstream economic signals (populated in state.py and refined by production.py).
+    recipe_margins: dict[str, float] = field(default_factory=dict)
+    material_shadow_value: dict[str, float] = field(default_factory=dict)
     target_material_demand: dict[str, int] = field(default_factory=dict)
 
     # Internal previous-turn snapshots for mass-balance & capacity inference.
     _prev_inventory: dict[str, int] | None = None
     _prev_reserve_prices: dict[str, float] = field(default_factory=dict)
     _max_reserve_prices: dict[str, float] = field(default_factory=dict)
+    _prev_public_capital: dict[str, float] = field(default_factory=dict)
+    _prev_comp_finished: dict[str, int] = field(default_factory=dict)
+    _rival_inflow_ema: float = 0.0
 
     def update(self, state: Observation, goods_config: GoodsConfig) -> None:
         """Advance shared market estimates using the latest turn observation."""
@@ -159,12 +166,17 @@ class MarketContext:
         # 5. Compute own per-turn mass balance, fill rates, and capacity detection.
         self._update_own_accounting(state, goods_config, prev_bids, prev_assembly)
 
-        # 6. Compute active competitor inventory intelligence.
+        # 6. Compute active competitor inventory intelligence & market demand heat.
         self._update_competitor_intelligence(state, goods_config)
 
-        # 7. Save current snapshot for next turn's delta calculations.
+        # 7. Refresh per-recipe estimated margins and baseline material shadow values.
+        self._update_recipe_economics(goods_config)
+
+        # 8. Save current snapshot for next turn's delta calculations.
         self._prev_inventory = dict(state.inventory)
         self._prev_reserve_prices = current_reserves
+        self._prev_public_capital = dict(state.public_capital)
+        self._prev_comp_finished = dict(self.competitor_finished_inventory)
 
     def _update_own_accounting(
         self,
@@ -295,7 +307,9 @@ class MarketContext:
     ) -> None:
         comp_finished = {g: 0 for g in goods_config.finished_goods}
         comp_raw = {m: 0 for m in goods_config.raw_materials}
+        rival_deltas: dict[str, float] = {}
         active_rivals = 0
+        positive_inflow = 0.0
 
         for tid, inv in state.public_inventories.items():
             if tid == self.team_id:
@@ -304,6 +318,11 @@ class MarketContext:
             if cap < 0.0:
                 continue
             active_rivals += 1
+            if tid in self._prev_public_capital:
+                delta = cap - self._prev_public_capital[tid]
+                rival_deltas[tid] = delta
+                if delta > 0.0:
+                    positive_inflow += delta
             for g in goods_config.finished_goods:
                 comp_finished[g] += inv.get(g, 0)
             for m in goods_config.raw_materials:
@@ -312,6 +331,50 @@ class MarketContext:
         self.active_competitor_count = active_rivals
         self.competitor_finished_inventory = comp_finished
         self.competitor_raw_inventory = comp_raw
+        self.rival_capital_delta = rival_deltas
+
+        # Track market demand heat from positive rival cash inflows + own sales velocity.
+        own_rev_turn = sum(self.own_revenue_last_turn.values())
+        total_flow = positive_inflow + own_rev_turn
+        if self._prev_public_capital:
+            if self._rival_inflow_ema <= 0.0:
+                self._rival_inflow_ema = total_flow
+                self.market_demand_heat = 1.0
+            else:
+                ratio = total_flow / max(1.0, self._rival_inflow_ema)
+                raw_heat = max(0.3, min(2.0, ratio))
+                self.market_demand_heat = 0.65 * self.market_demand_heat + 0.35 * raw_heat
+                self._rival_inflow_ema = 0.75 * self._rival_inflow_ema + 0.25 * total_flow
+
+    def _update_recipe_economics(self, goods_config: GoodsConfig) -> None:
+        """Compute baseline per-recipe margins and per-material shadow values."""
+        margins: dict[str, float] = {}
+        baseline_shadow: dict[str, float] = {m: 0.0 for m in goods_config.raw_materials}
+
+        for r_name, recipe in goods_config.recipes.items():
+            rev = self.estimate_good_revenue(recipe.output_good, goods_config)
+            cost = self.estimate_recipe_cost(r_name, goods_config)
+            margin = rev - cost
+            margins[r_name] = margin
+
+            total_inputs = sum(recipe.inputs.values())
+            if total_inputs <= 0 or rev <= 0.0:
+                continue
+            # Value per input unit proportional to material's cost share (or uniform if zero cost).
+            for mat, units in recipe.inputs.items():
+                if cost > 1e-6:
+                    mat_share = (self.avg_material_cost.get(mat, 0.0) * units) / cost
+                    implied_val = (rev * mat_share) / units
+                else:
+                    implied_val = rev / total_inputs
+                if implied_val > baseline_shadow.get(mat, 0.0):
+                    baseline_shadow[mat] = implied_val
+
+        self.recipe_margins = margins
+        for mat, val in baseline_shadow.items():
+            # Keep any higher/refined shadow value set by production if already initialized,
+            # while refreshing the floor each turn.
+            self.material_shadow_value[mat] = val
 
     def estimate_recipe_cost(self, recipe_name: str, goods_config: GoodsConfig) -> float:
         """Return estimated raw-material unit cost for one unit of `recipe_name`."""

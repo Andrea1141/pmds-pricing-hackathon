@@ -78,14 +78,13 @@ class ProductionStrategy:
             r_name: ctx.estimate_recipe_cost(r_name, goods_config)
             for r_name in recipes
         }
-        mat_weights = self._compute_material_weights(
-            goods_config, ctx, projected_raw, recipe_rev, recipe_cost
-        )
-
         # Base finished-good inventory already on shelf before Phase 2.
         shelf_inv = {
             g: state.inventory.get(g, 0) for g in goods_config.finished_goods
         }
+        mat_weights = self._compute_material_weights(
+            goods_config, ctx, projected_raw, target_stock, shelf_inv, recipe_rev, recipe_cost
+        )
         cap = ctx.estimated_capacity_per_turn
 
         # Wave 1: optimize over projected post-auction materials.
@@ -135,9 +134,19 @@ class ProductionStrategy:
                     capacity_limit=rem_cap,
                 )
 
-        # Publish desired raw-material demand for optional downstream coordination.
+        # Publish desired raw-material demand & marginal shadow values for coordination.
         self._update_target_material_demand(
             goods_config, ctx, target_stock, shelf_inv, recipe_rev, recipe_cost
+        )
+        self._update_shadow_values(
+            projected_raw=projected_raw,
+            wave1_plan=wave1_plan,
+            shelf_inv=shelf_inv,
+            goods_config=goods_config,
+            ctx=ctx,
+            target_stock=target_stock,
+            recipe_rev=recipe_rev,
+            recipe_cost=recipe_cost,
         )
 
         return self._coalesce_orders(wave1_sequence + wave2_sequence)
@@ -191,15 +200,20 @@ class ProductionStrategy:
         goods_config: GoodsConfig,
         ctx: MarketContext,
         raw_pool: dict[str, int],
+        target_stock: dict[str, int],
+        shelf_inv: dict[str, int],
         recipe_rev: dict[str, float],
         recipe_cost: dict[str, float],
     ) -> dict[str, float]:
-        """Compute scarcity-adjusted resource weights for efficiency scoring."""
+        """Compute scarcity-adjusted resource weights with surplus flushing."""
         demand_weight: dict[str, float] = {m: 0.0 for m in goods_config.raw_materials}
+        est_mat_need: dict[str, int] = {m: 0 for m in goods_config.raw_materials}
         for r_name, recipe in goods_config.recipes.items():
             margin = max(1.0, recipe_rev[r_name] - recipe_cost[r_name])
+            needed_goods = max(1, target_stock.get(recipe.output_good, 2) - shelf_inv.get(recipe.output_good, 0))
             for mat, units in recipe.inputs.items():
                 demand_weight[mat] = demand_weight.get(mat, 0.0) + units * margin
+                est_mat_need[mat] = est_mat_need.get(mat, 0) + units * needed_goods
 
         avg_cost = (
             sum(ctx.avg_material_cost.get(m, 0.0) for m in goods_config.raw_materials)
@@ -211,9 +225,18 @@ class ProductionStrategy:
         for mat in goods_config.raw_materials:
             unit_cost = max(base_floor, ctx.avg_material_cost.get(mat, 0.0))
             scarcity = ctx.lot_scarcity.get(mat, 0.5)
-            pool_tightness = 1.0 / max(1.0, float(raw_pool.get(mat, 0)))
+            pool_qty = raw_pool.get(mat, 0)
+            pool_tightness = 1.0 / max(1.0, float(pool_qty))
             demand_boost = 0.25 if demand_weight.get(mat, 0.0) > 0.0 else 0.0
-            weights[mat] = unit_cost * (1.0 + 0.6 * scarcity + demand_boost + 0.5 * pool_tightness)
+            weight = unit_cost * (1.0 + 0.6 * scarcity + demand_boost + 0.5 * pool_tightness)
+
+            # Surplus flushing: if we hold far more of a material than recipes need,
+            # discount its weight so recipes burning abundant surplus aren't penalized.
+            need = max(1, est_mat_need.get(mat, 1))
+            if pool_qty > 2.5 * need:
+                surplus_ratio = need / float(pool_qty)
+                weight *= max(0.15, surplus_ratio * 2.5)
+            weights[mat] = max(0.15 * base_floor, weight)
         return weights
 
     def _marginal_utility(
@@ -596,6 +619,71 @@ class ProductionStrategy:
             for mat, units in goods_config.recipes[r_name].inputs.items():
                 demand[mat] = demand.get(mat, 0) + units * needed_goods
         ctx.target_material_demand = demand
+
+    def _update_shadow_values(
+        self,
+        projected_raw: dict[str, int],
+        wave1_plan: dict[str, int],
+        shelf_inv: dict[str, int],
+        goods_config: GoodsConfig,
+        ctx: MarketContext,
+        target_stock: dict[str, int],
+        recipe_rev: dict[str, float],
+        recipe_cost: dict[str, float],
+    ) -> None:
+        """Estimate marginal revenue value (+1 unit) of each raw material."""
+        recipes = goods_config.recipes
+        rem_raw = dict(projected_raw)
+        after_shelf = dict(shelf_inv)
+        for r_name, qty in wave1_plan.items():
+            if qty <= 0:
+                continue
+            recipe = recipes[r_name]
+            for mat, units in recipe.inputs.items():
+                rem_raw[mat] = max(0, rem_raw.get(mat, 0) - units * qty)
+            after_shelf[recipe.output_good] = after_shelf.get(recipe.output_good, 0) + qty
+
+        shadows: dict[str, float] = {}
+        for mat in goods_config.raw_materials:
+            baseline = ctx.material_shadow_value.get(mat, 0.0)
+            best_unlock = 0.0
+            for r_name, recipe in recipes.items():
+                req_mat = recipe.inputs.get(mat, 0)
+                if req_mat <= 0:
+                    continue
+                # Check if adding +1 unit of `mat` directly completes this recipe,
+                # or reduces its missing-input deficit.
+                missing_other = sum(
+                    max(0, u - rem_raw.get(m, 0))
+                    for m, u in recipe.inputs.items()
+                    if m != mat
+                )
+                missing_self = max(0, req_mat - rem_raw.get(mat, 0))
+                util = self._marginal_utility(
+                    r_name,
+                    after_shelf.get(recipe.output_good, 0),
+                    goods_config,
+                    ctx,
+                    target_stock,
+                    recipe_rev,
+                    recipe_cost,
+                )
+                if util <= 0.0:
+                    continue
+                if missing_other == 0 and missing_self == 1:
+                    # Direct bottleneck: +1 unit immediately unlocks an entire finished good!
+                    best_unlock = max(best_unlock, util)
+                elif missing_self > 0:
+                    total_missing = missing_other + missing_self
+                    best_unlock = max(best_unlock, util / max(1, total_missing))
+
+            # Blend direct bottleneck unlock with baseline economic value per unit.
+            if best_unlock > 0.0:
+                shadows[mat] = 0.65 * best_unlock + 0.35 * baseline
+            else:
+                # Non-bottleneck surplus material: discount baseline value.
+                shadows[mat] = 0.5 * baseline
+        ctx.material_shadow_value = shadows
 
     @staticmethod
     def _coalesce_orders(sequence: list[tuple[str, int]]) -> list[AssemblyOrder]:
