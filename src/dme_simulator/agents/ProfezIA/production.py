@@ -24,8 +24,8 @@ class ProductionStrategy:
     """Computes ordered assembly instructions for raw materials -> finished goods."""
 
     _MAX_GREEDY_STEPS = 80
-    _MAX_SWAP_ITERS = 30
-    _MAX_LOCAL_SEARCH_SEC = 0.012
+    _MAX_SWAP_ITERS = 15
+    _MAX_LOCAL_SEARCH_SEC = 0.004
 
     def __init__(self) -> None:
         pass
@@ -61,7 +61,7 @@ class ProductionStrategy:
         projected_raw: dict[str, int] = {}
         optimistic_raw: dict[str, int] = {}
         for mat in goods_config.raw_materials:
-            owned = state.inventory.get(mat, 0)
+            owned = max(0, int(state.inventory.get(mat, 0)))
             bid_q = valid_bid_qty.get(mat, 0)
             fill = ctx.auction_fill_rate.get(mat, 0.60)
             expected_add = int(round(bid_q * fill))
@@ -69,6 +69,12 @@ class ProductionStrategy:
                 expected_add = 1
             projected_raw[mat] = owned + expected_add
             optimistic_raw[mat] = owned + bid_q
+
+        # Precompute flat input tuples once per turn for fast inner loops.
+        recipe_inputs = {
+            r_name: tuple((m, int(u)) for m, u in recipe.inputs.items() if u > 0)
+            for r_name, recipe in recipes.items()
+        }
 
         # Compute per-good soft shelf-stock targets and economic parameters.
         target_stock = self._compute_target_stocks(state, goods_config, ctx)
@@ -82,12 +88,14 @@ class ProductionStrategy:
         }
         # Base finished-good inventory already on shelf before Phase 2.
         shelf_inv = {
-            g: state.inventory.get(g, 0) for g in goods_config.finished_goods
+            g: max(0, int(state.inventory.get(g, 0)))
+            for g in goods_config.finished_goods
         }
         mat_weights = self._compute_material_weights(
             goods_config, ctx, projected_raw, target_stock, shelf_inv, recipe_rev, recipe_cost
         )
         cap = ctx.estimated_capacity_per_turn
+        search_deadline = perf_counter() + self._MAX_LOCAL_SEARCH_SEC
 
         # Wave 1: optimize over projected post-auction materials.
         wave1_plan, wave1_sequence = self._solve_production_plan(
@@ -100,6 +108,8 @@ class ProductionStrategy:
             recipe_cost=recipe_cost,
             mat_weights=mat_weights,
             capacity_limit=cap,
+            recipe_inputs=recipe_inputs,
+            search_deadline=search_deadline,
         )
 
         # Wave 2: compute upside overflow if Phase 1 bids fill better than expected.
@@ -115,7 +125,7 @@ class ProductionStrategy:
                 if qty <= 0:
                     continue
                 recipe = recipes[r_name]
-                for mat, units in recipe.inputs.items():
+                for mat, units in recipe_inputs[r_name]:
                     rem_raw[mat] = max(0, rem_raw.get(mat, 0) - units * qty)
                 after_w1_shelf[recipe.output_good] = (
                     after_w1_shelf.get(recipe.output_good, 0) + qty
@@ -134,6 +144,8 @@ class ProductionStrategy:
                     recipe_cost=recipe_cost,
                     mat_weights=mat_weights,
                     capacity_limit=rem_cap,
+                    recipe_inputs=recipe_inputs,
+                    search_deadline=search_deadline,
                 )
 
         # Publish desired raw-material demand & marginal shadow values for coordination.
@@ -330,6 +342,23 @@ class ProductionStrategy:
 
         return base_value
 
+    @staticmethod
+    def _max_buildable(
+        raw_inv: dict[str, int],
+        inputs: tuple[tuple[str, int], ...],
+    ) -> int:
+        if not inputs:
+            return 0
+        best = 1_000_000_000
+        for m, u in inputs:
+            avail = raw_inv.get(m, 0)
+            if avail < u:
+                return 0
+            q = avail // u
+            if q < best:
+                best = q
+        return best
+
     def _solve_production_plan(
         self,
         raw_pool: dict[str, int],
@@ -341,9 +370,16 @@ class ProductionStrategy:
         recipe_cost: dict[str, float],
         mat_weights: dict[str, float],
         capacity_limit: int | None,
+        recipe_inputs: dict[str, tuple[tuple[str, int], ...]] | None = None,
+        search_deadline: float | None = None,
     ) -> tuple[dict[str, int], list[tuple[str, int]]]:
         """Solve integer production allocation via resource-weighted greedy + local swap."""
         recipes = goods_config.recipes
+        if recipe_inputs is None:
+            recipe_inputs = {
+                r_name: tuple((m, int(u)) for m, u in r.inputs.items() if u > 0)
+                for r_name, r in recipes.items()
+            }
         rem_raw = dict(raw_pool)
         planned_good = dict(shelf_inv)
         plan: dict[str, int] = {r_name: 0 for r_name in recipes}
@@ -351,11 +387,10 @@ class ProductionStrategy:
 
         # Compute rough upper bound on buildable units to choose chunk size for speed (<1 ms).
         raw_max_possible = 0
-        for recipe in recipes.values():
-            if not recipe.inputs:
-                continue
-            can_make = min(rem_raw.get(m, 0) // u for m, u in recipe.inputs.items())
-            raw_max_possible = max(raw_max_possible, can_make)
+        for r_name in recipes:
+            can_make = self._max_buildable(rem_raw, recipe_inputs[r_name])
+            if can_make > raw_max_possible:
+                raw_max_possible = can_make
         max_possible = (
             min(raw_max_possible, capacity_limit)
             if capacity_limit is not None
@@ -364,21 +399,25 @@ class ProductionStrategy:
         if max_possible <= 0:
             return plan, sequence
 
-        step_size = max(1, max_possible // 60)
+        needed_total = sum(
+            max(0, target_stock.get(g, 2) - shelf_inv.get(g, 0))
+            for g in goods_config.finished_goods
+        )
+        step_size = max(1, ceil(max(max_possible, needed_total) / 50))
 
         # Precompute resource denominator per recipe.
         # When capacity_per_turn is binding, shift denominator toward 1.0 (unit margin).
         cap_binding = capacity_limit is not None and capacity_limit < raw_max_possible
         avg_recipe_weight = (
             sum(
-                sum(mat_weights.get(m, 1.0) * u for m, u in r.inputs.items())
-                for r in recipes.values()
+                sum(mat_weights.get(m, 1.0) * u for m, u in recipe_inputs[rn])
+                for rn in recipes
             )
             / max(1, len(recipes))
         )
         recipe_denom: dict[str, float] = {}
-        for r_name, recipe in recipes.items():
-            mat_w = sum(mat_weights.get(m, 1.0) * u for m, u in recipe.inputs.items())
+        for r_name in recipes:
+            mat_w = sum(mat_weights.get(m, 1.0) * u for m, u in recipe_inputs[r_name])
             if cap_binding:
                 recipe_denom[r_name] = 0.75 * avg_recipe_weight + 0.25 * max(1.0, mat_w)
             else:
@@ -397,11 +436,12 @@ class ProductionStrategy:
             best_chunk = 0
 
             for r_name, recipe in recipes.items():
-                if not recipe.inputs:
+                inputs_t = recipe_inputs[r_name]
+                if not inputs_t:
                     continue
-                can_make = min(rem_raw.get(m, 0) // u for m, u in recipe.inputs.items())
-                if rem_cap is not None:
-                    can_make = min(can_make, rem_cap)
+                can_make = self._max_buildable(rem_raw, inputs_t)
+                if rem_cap is not None and rem_cap < can_make:
+                    can_make = rem_cap
                 if can_make <= 0:
                     continue
 
@@ -429,12 +469,10 @@ class ProductionStrategy:
             if best_recipe is None or best_chunk <= 0:
                 break
 
-            recipe = recipes[best_recipe]
-            for mat, units in recipe.inputs.items():
+            for mat, units in recipe_inputs[best_recipe]:
                 rem_raw[mat] -= units * best_chunk
-            planned_good[recipe.output_good] = (
-                planned_good.get(recipe.output_good, 0) + best_chunk
-            )
+            out_g = recipes[best_recipe].output_good
+            planned_good[out_g] = planned_good.get(out_g, 0) + best_chunk
             plan[best_recipe] += best_chunk
             sequence.append((best_recipe, best_chunk))
             if rem_cap is not None:
@@ -453,6 +491,8 @@ class ProductionStrategy:
             recipe_rev=recipe_rev,
             recipe_cost=recipe_cost,
             recipe_denom=recipe_denom,
+            recipe_inputs=recipe_inputs,
+            search_deadline=search_deadline,
         )
         if improved:
             sequence = self._rebuild_priority_sequence(
@@ -480,14 +520,25 @@ class ProductionStrategy:
         recipe_rev: dict[str, float],
         recipe_cost: dict[str, float],
         recipe_denom: dict[str, float],
+        recipe_inputs: dict[str, tuple[tuple[str, int], ...]] | None = None,
+        search_deadline: float | None = None,
     ) -> bool:
         """Try removing 1 unit of a planned recipe to fit strictly higher total utility."""
         recipes = goods_config.recipes
         if len(recipes) <= 1:
             return False
+        if recipe_inputs is None:
+            recipe_inputs = {
+                r_name: tuple((m, int(u)) for m, u in r.inputs.items() if u > 0)
+                for r_name, r in recipes.items()
+            }
 
         any_improved = False
-        deadline = perf_counter() + self._MAX_LOCAL_SEARCH_SEC
+        deadline = (
+            search_deadline
+            if search_deadline is not None
+            else (perf_counter() + self._MAX_LOCAL_SEARCH_SEC)
+        )
         for _ in range(self._MAX_SWAP_ITERS):
             if perf_counter() >= deadline:
                 break
@@ -496,6 +547,8 @@ class ProductionStrategy:
 
             active_recipes = [r for r, qty in plan.items() if qty > 0]
             for remove_r in active_recipes:
+                if perf_counter() >= deadline:
+                    break
                 rem_recipe = recipes[remove_r]
                 rem_good = rem_recipe.output_good
                 # Utility lost by dropping the last unit of remove_r.
@@ -511,7 +564,7 @@ class ProductionStrategy:
 
                 # Temporarily free remove_r's materials and capacity.
                 trial_raw = dict(rem_raw)
-                for mat, units in rem_recipe.inputs.items():
+                for mat, units in recipe_inputs[remove_r]:
                     trial_raw[mat] = trial_raw.get(mat, 0) + units
                 trial_good = dict(planned_good)
                 trial_good[rem_good] -= 1
@@ -527,9 +580,17 @@ class ProductionStrategy:
                     cand_score = 0.0
                     cand_util = 0.0
                     for r_name, recipe in recipes.items():
-                        if r_name == remove_r or not recipe.inputs:
+                        if r_name == remove_r:
                             continue
-                        if any(trial_raw.get(m, 0) < u for m, u in recipe.inputs.items()):
+                        inputs_t = recipe_inputs[r_name]
+                        if not inputs_t:
+                            continue
+                        ok = True
+                        for m, u in inputs_t:
+                            if trial_raw.get(m, 0) < u:
+                                ok = False
+                                break
+                        if not ok:
                             continue
                         u_val = self._marginal_utility(
                             r_name,
@@ -551,10 +612,10 @@ class ProductionStrategy:
                         break
                     added.append(cand_r)
                     gained_util += cand_util
-                    c_rec = recipes[cand_r]
-                    for mat, units in c_rec.inputs.items():
+                    for mat, units in recipe_inputs[cand_r]:
                         trial_raw[mat] -= units
-                    trial_good[c_rec.output_good] = trial_good.get(c_rec.output_good, 0) + 1
+                    out_c = recipes[cand_r].output_good
+                    trial_good[out_c] = trial_good.get(out_c, 0) + 1
                     if trial_cap is not None:
                         trial_cap -= 1
 
@@ -569,7 +630,7 @@ class ProductionStrategy:
             remove_r, added = best_move
             rem_recipe = recipes[remove_r]
             plan[remove_r] -= 1
-            for mat, units in rem_recipe.inputs.items():
+            for mat, units in recipe_inputs[remove_r]:
                 rem_raw[mat] = rem_raw.get(mat, 0) + units
             planned_good[rem_recipe.output_good] -= 1
             if rem_cap is not None:
@@ -578,7 +639,7 @@ class ProductionStrategy:
             for add_r in added:
                 add_recipe = recipes[add_r]
                 plan[add_r] += 1
-                for mat, units in add_recipe.inputs.items():
+                for mat, units in recipe_inputs[add_r]:
                     rem_raw[mat] -= units
                 planned_good[add_recipe.output_good] = (
                     planned_good.get(add_recipe.output_good, 0) + 1

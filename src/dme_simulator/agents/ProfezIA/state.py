@@ -99,6 +99,25 @@ class MarketContext:
     _prev_public_capital: dict[str, float] = field(default_factory=dict)
     _prev_comp_finished: dict[str, int] = field(default_factory=dict)
     _rival_inflow_ema: float = 0.0
+    _candidate_team_ids: set[str] | None = None
+    _single_own_buyer_if_unresolved: bool = False
+    _single_own_seller_if_unresolved: bool = False
+
+    def is_own_auction_tx(self, tx: AuctionResult) -> bool:
+        """Return True iff `tx` is known (or uniquely narrowed) to belong to us."""
+        if self.team_id is not None:
+            return tx.buyer == self.team_id
+        return self._single_own_buyer_if_unresolved and (
+            self._candidate_team_ids is None or tx.buyer in self._candidate_team_ids
+        )
+
+    def is_own_sales_tx(self, sale: SalesPrice) -> bool:
+        """Return True iff `sale` is known (or uniquely narrowed) to belong to us."""
+        if self.team_id is not None:
+            return sale.seller == self.team_id
+        return self._single_own_seller_if_unresolved and (
+            self._candidate_team_ids is None or sale.seller in self._candidate_team_ids
+        )
 
     def update(self, state: Observation, goods_config: GoodsConfig) -> None:
         """Advance shared market estimates using the latest turn observation."""
@@ -116,11 +135,28 @@ class MarketContext:
         self.new_sales_txs = state.sales_transactions[self._seen_sales_count :]
         self._seen_sales_count = len(state.sales_transactions)
 
-        # 2. Identify our own team_id as early as possible.
+        # 2. Identify our own team_id as early as possible without misattributing
+        #    competitor transactions when `observe_all_transactions=True`.
         if self.team_id is None:
             self.team_id = self._infer_team_id(
                 state, self.new_auction_txs, self.new_sales_txs
             )
+        candidates = self._candidate_team_ids or set()
+        if self.team_id is None and self.new_auction_txs:
+            buyers = {tx.buyer for tx in self.new_auction_txs}
+            self._single_own_buyer_if_unresolved = (
+                len(buyers) == 1 and (not candidates or buyers <= candidates)
+            )
+        else:
+            self._single_own_buyer_if_unresolved = False
+
+        if self.team_id is None and self.new_sales_txs:
+            sellers = {s.seller for s in self.new_sales_txs}
+            self._single_own_seller_if_unresolved = (
+                len(sellers) == 1 and (not candidates or sellers <= candidates)
+            )
+        else:
+            self._single_own_seller_if_unresolved = False
 
         # 3. Record current auction lots, reserve history, and lot scarcity.
         current_reserves: dict[str, float] = {}
@@ -144,32 +180,38 @@ class MarketContext:
                 scarcity = price_pressure
             self.lot_scarcity[lot.good] = max(0.0, min(1.0, scarcity))
 
-        # 4. Update running material cost & finished-good sale price estimates.
+        # 4. Update running material cost & finished-good sale price estimates (single pass).
         # Protect estimates from competitor noise when `observe_all_transactions=True`:
         # prioritize own transactions; use rival transactions only as fallback/ceiling.
         alpha_price = 0.35
-        own_auc_txs = (
-            [tx for tx in self.new_auction_txs if tx.buyer == self.team_id]
-            if self.team_id is not None
-            else self.new_auction_txs
-        )
-        auc_source = own_auc_txs if own_auc_txs else self.new_auction_txs
-        for tx in auc_source:
-            prev = self.avg_material_cost.get(tx.good, tx.price)
-            # When falling back to rival auction txs, blend gently so whale overbids
-            # don't distort our replacement cost.
-            w = alpha_price if own_auc_txs else 0.15
-            self.avg_material_cost[tx.good] = (1.0 - w) * prev + w * tx.price
+        own_auc_txs: list[AuctionResult] = []
+        rival_auc_txs: list[AuctionResult] = []
+        for tx in self.new_auction_txs:
+            if self.is_own_auction_tx(tx):
+                own_auc_txs.append(tx)
+            else:
+                rival_auc_txs.append(tx)
 
+        if own_auc_txs:
+            for tx in own_auc_txs:
+                prev = self.avg_material_cost.get(tx.good, tx.price)
+                self.avg_material_cost[tx.good] = (1.0 - alpha_price) * prev + alpha_price * tx.price
+        elif rival_auc_txs:
+            for tx in rival_auc_txs:
+                prev = self.avg_material_cost.get(tx.good, tx.price)
+                self.avg_material_cost[tx.good] = 0.85 * prev + 0.15 * tx.price
+
+        own_sale_txs: list[SalesPrice] = []
+        rival_sales_by_good: dict[str, list[float]] = {}
+        mkt_max = self.market_max_sale_price
         for sale in self.new_sales_txs:
-            if sale.price > self.market_max_sale_price.get(sale.good, 0.0):
-                self.market_max_sale_price[sale.good] = sale.price
+            if sale.price > mkt_max.get(sale.good, 0.0):
+                mkt_max[sale.good] = sale.price
+            if self.is_own_sales_tx(sale):
+                own_sale_txs.append(sale)
+            elif sale.price > 0.0:
+                rival_sales_by_good.setdefault(sale.good, []).append(sale.price)
 
-        own_sale_txs = (
-            [s for s in self.new_sales_txs if s.seller == self.team_id]
-            if self.team_id is not None
-            else self.new_sales_txs
-        )
         for sale in own_sale_txs:
             prev = self.est_sale_price.get(sale.good, 0.0)
             if prev <= 0.0:
@@ -178,20 +220,20 @@ class MarketContext:
                 self.est_sale_price[sale.good] = (
                     (1.0 - alpha_price) * prev + alpha_price * sale.price
                 )
+
         # If we have never sold `good` ourselves, seed `est_sale_price` from upper
         # rival transaction prices (ignoring fire-sale dumps).
-        if self.team_id is not None:
-            rival_sales_by_good: dict[str, list[float]] = {}
-            for sale in self.new_sales_txs:
-                if sale.seller != self.team_id and sale.price > 0.0:
-                    rival_sales_by_good.setdefault(sale.good, []).append(sale.price)
+        if rival_sales_by_good:
             for good, prices in rival_sales_by_good.items():
-                if self.sales_count_by_good.get(good, 0) == 0:
+                if self.sales_count_by_good.get(good, 0) == 0 and not any(
+                    s.good == good for s in own_sale_txs
+                ):
                     prices.sort()
-                    # Use 75th percentile of rival sales as a clean cold-start signal.
                     p75 = prices[int(0.75 * (len(prices) - 1))]
                     prev = self.est_sale_price.get(good, 0.0)
-                    self.est_sale_price[good] = p75 if prev <= 0.0 else max(prev, 0.7 * prev + 0.3 * p75)
+                    self.est_sale_price[good] = (
+                        p75 if prev <= 0.0 else max(prev, 0.7 * prev + 0.3 * p75)
+                    )
 
         # Ensure every raw material and finished good has a fallback key.
         for raw in goods_config.raw_materials:
@@ -206,7 +248,9 @@ class MarketContext:
             self.own_unsold_streak.setdefault(good, 0)
 
         # 5. Compute own per-turn mass balance, fill rates, and capacity detection.
-        self._update_own_accounting(state, goods_config, prev_bids, prev_assembly)
+        self._update_own_accounting(
+            state, goods_config, prev_bids, prev_assembly, own_auc_txs, own_sale_txs
+        )
 
         # 6. Compute active competitor inventory intelligence & market demand heat.
         self._update_competitor_intelligence(state, goods_config)
@@ -226,36 +270,21 @@ class MarketContext:
         goods_config: GoodsConfig,
         prev_bids: list[Bid],
         prev_assembly: list[AssemblyOrder],
+        own_auc_txs: list[AuctionResult],
+        own_sale_txs: list[SalesPrice],
     ) -> None:
         own_won: dict[str, int] = {}
         own_spend: dict[str, float] = {}
         own_sold: dict[str, int] = {}
         own_rev: dict[str, float] = {}
 
-        # Identify which transactions belong to us.
-        if self.team_id is not None:
-            for tx in self.new_auction_txs:
-                if tx.buyer == self.team_id:
-                    own_won[tx.good] = own_won.get(tx.good, 0) + tx.quantity
-                    own_spend[tx.good] = own_spend.get(tx.good, 0.0) + tx.price * tx.quantity
-            for sale in self.new_sales_txs:
-                if sale.seller == self.team_id:
-                    own_sold[sale.good] = own_sold.get(sale.good, 0) + sale.quantity
-                    own_rev[sale.good] = own_rev.get(sale.good, 0.0) + sale.price * sale.quantity
-                    self.own_last_sale_price[sale.good] = sale.price
-        else:
-            # Fallback if team_id is still ambiguous: accept only if a single actor appears.
-            buyers = {tx.buyer for tx in self.new_auction_txs}
-            if len(buyers) == 1:
-                for tx in self.new_auction_txs:
-                    own_won[tx.good] = own_won.get(tx.good, 0) + tx.quantity
-                    own_spend[tx.good] = own_spend.get(tx.good, 0.0) + tx.price * tx.quantity
-            sellers = {s.seller for s in self.new_sales_txs}
-            if len(sellers) == 1:
-                for sale in self.new_sales_txs:
-                    own_sold[sale.good] = own_sold.get(sale.good, 0) + sale.quantity
-                    own_rev[sale.good] = own_rev.get(sale.good, 0.0) + sale.price * sale.quantity
-                    self.own_last_sale_price[sale.good] = sale.price
+        for tx in own_auc_txs:
+            own_won[tx.good] = own_won.get(tx.good, 0) + tx.quantity
+            own_spend[tx.good] = own_spend.get(tx.good, 0.0) + tx.price * tx.quantity
+        for sale in own_sale_txs:
+            own_sold[sale.good] = own_sold.get(sale.good, 0) + sale.quantity
+            own_rev[sale.good] = own_rev.get(sale.good, 0.0) + sale.price * sale.quantity
+            self.own_last_sale_price[sale.good] = sale.price
 
         self.own_won_last_turn = own_won
         self.own_spend_last_turn = own_spend
@@ -347,32 +376,47 @@ class MarketContext:
     def _update_competitor_intelligence(
         self, state: Observation, goods_config: GoodsConfig
     ) -> None:
-        comp_finished = {g: 0 for g in goods_config.finished_goods}
-        comp_raw = {m: 0 for m in goods_config.raw_materials}
-        comp_sellers = {g: 0 for g in goods_config.finished_goods}
+        finished_goods = goods_config.finished_goods
+        raw_materials = goods_config.raw_materials
+        comp_finished = {g: 0 for g in finished_goods}
+        comp_raw = {m: 0 for m in raw_materials}
+        comp_sellers = {g: 0 for g in finished_goods}
         rival_deltas: dict[str, float] = {}
         active_rivals = 0
         positive_inflow = 0.0
+        pub_cap = state.public_capital
+        prev_pub_cap = self._prev_public_capital
+        own_id = self.team_id
+        skipped_self_fallback = own_id is not None
 
         for tid, inv in state.public_inventories.items():
-            if tid == self.team_id:
+            if tid == own_id:
                 continue
-            cap = state.public_capital.get(tid, 0.0)
+            cap = pub_cap.get(tid, 0.0)
             if cap < 0.0:
                 continue
+            if (
+                not skipped_self_fallback
+                and inv == state.inventory
+                and abs(cap - state.capital) < 1e-6
+            ):
+                skipped_self_fallback = True
+                continue
             active_rivals += 1
-            if tid in self._prev_public_capital:
-                delta = cap - self._prev_public_capital[tid]
+            if tid in prev_pub_cap:
+                delta = cap - prev_pub_cap[tid]
                 rival_deltas[tid] = delta
                 if delta > 0.0:
                     positive_inflow += delta
-            for g in goods_config.finished_goods:
+            for g in finished_goods:
                 q_g = inv.get(g, 0)
                 if q_g > 0:
                     comp_finished[g] += q_g
                     comp_sellers[g] += 1
-            for m in goods_config.raw_materials:
-                comp_raw[m] += inv.get(m, 0)
+            for m in raw_materials:
+                q_m = inv.get(m, 0)
+                if q_m > 0:
+                    comp_raw[m] += q_m
 
         self.active_competitor_count = active_rivals
         self.competitor_finished_inventory = comp_finished
@@ -380,27 +424,23 @@ class MarketContext:
         self.competitor_sellers_by_good = comp_sellers
         denom_rivals = max(1, active_rivals)
         self.crowding_ratio_by_good = {
-            g: comp_sellers[g] / denom_rivals for g in goods_config.finished_goods
+            g: comp_sellers[g] / denom_rivals for g in finished_goods
         }
-        total_teams = max(1, len(state.public_capital))
+        active_teams = max(1, active_rivals + 1)
         total_lot_units = sum(max(0, lot.quantity) for lot in state.auction_lots)
-        self.supply_per_team = total_lot_units / float(total_teams)
+        self.supply_per_team = total_lot_units / float(active_teams)
 
-        self.is_crowded_tournament = total_teams >= 10
-        # Micro-crowded negative-EV regime (e.g. 30-44 teams fighting over tiny lots):
-        # protect capital instead of overbidding into a red ocean.
-        self.is_micro_crowded = total_teams >= 16 and self.supply_per_team < 6.0
+        self.is_crowded_tournament = active_teams >= 10
+        # Real negative-EV & bottleneck protection now lives cleanly inside bidding.py
+        # (recipe-bundle ROI gate + bottleneck fill-rate conditioning) instead of blindly
+        # choking profitable 38-44 team rooms.
+        self.is_micro_crowded = False
         # High-volume / long-horizon compounding regime (e.g. scaled_market, 240-turn extended):
         self.is_high_volume_expansion = (
             (state.turn >= 12 and self.supply_per_team >= 12.0)
             or self.supply_per_team >= 25.0
         )
-        # Only run early blitz when crowded AND lots have enough supply per team to profit.
-        self.is_blitz_window = (
-            self.is_crowded_tournament
-            and not self.is_micro_crowded
-            and state.turn <= 6
-        )
+        self.is_blitz_window = self.is_crowded_tournament and state.turn <= 6
         self.rival_capital_delta = rival_deltas
 
         # Track market demand heat from positive rival cash inflows + own sales velocity.
@@ -442,9 +482,8 @@ class MarketContext:
 
         self.recipe_margins = margins
         for mat, val in baseline_shadow.items():
-            # Keep any higher/refined shadow value set by production if already initialized,
-            # while refreshing the floor each turn.
-            self.material_shadow_value[mat] = val
+            prev_refined = self.material_shadow_value.get(mat, 0.0)
+            self.material_shadow_value[mat] = max(val, prev_refined * 0.70)
 
     def estimate_recipe_cost(self, recipe_name: str, goods_config: GoodsConfig) -> float:
         """Return estimated raw-material unit cost for one unit of `recipe_name`."""
@@ -490,26 +529,35 @@ class MarketContext:
             return good_cost * prior_ratio * tier_bonus
         return 100.0
 
-    @staticmethod
     def _infer_team_id(
+        self,
         state: Observation,
         new_auction_txs: list[AuctionResult],
         new_sales_txs: list[SalesPrice],
     ) -> str | None:
-        matches = [
+        matches = {
             tid
             for tid, inv in state.public_inventories.items()
             if inv == state.inventory
             and abs(state.public_capital.get(tid, -1.0) - state.capital) < 1e-6
-        ]
-        if len(matches) == 1:
-            return matches[0]
+        }
+        if matches:
+            if self._candidate_team_ids is None:
+                self._candidate_team_ids = matches
+            else:
+                narrowed_hist = self._candidate_team_ids & matches
+                self._candidate_team_ids = narrowed_hist if narrowed_hist else matches
+        elif self._candidate_team_ids is None:
+            self._candidate_team_ids = set(state.public_inventories)
 
-        match_set = set(matches) if matches else set(state.public_inventories)
+        if len(self._candidate_team_ids) == 1:
+            return next(iter(self._candidate_team_ids))
+
         tx_actors = {tx.buyer for tx in new_auction_txs} | {
             sale.seller for sale in new_sales_txs
         }
-        narrowed = match_set & tx_actors
-        if len(narrowed) == 1:
+        narrowed = self._candidate_team_ids & tx_actors
+        if len(narrowed) == 1 and tx_actors <= self._candidate_team_ids:
+            self._candidate_team_ids = narrowed
             return next(iter(narrowed))
         return None

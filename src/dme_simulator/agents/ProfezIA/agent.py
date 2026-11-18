@@ -51,6 +51,11 @@ class ProfezIAAgent(BaseAgent):
                 state.turn,
                 exc_info=True,
             )
+            self.ctx.turn = state.turn
+            self.ctx.new_auction_txs = []
+            self.ctx.new_sales_txs = []
+            self.ctx.planned_bids = []
+            self.ctx.planned_assembly = []
 
         raw_bids = self._safe_call(
             "bidding", self.bidding.decide_bids, state, goods_config, self.ctx

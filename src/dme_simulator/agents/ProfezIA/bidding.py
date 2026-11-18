@@ -15,6 +15,9 @@ from dme_simulator.config import GoodsConfig
 from .state import MarketContext
 
 
+_HORIZON_CHECKPOINTS = (20, 30, 40, 50, 60, 80, 100, 120, 150, 180, 200, 240)
+
+
 @dataclass
 class _MaterialBidState:
     """Internal per-material tracking for pay-your-bid auction optimization."""
@@ -29,6 +32,7 @@ class _MaterialBidState:
     demand_scale: float = 1.0
     mid_mult: float = 1.303
     high_mult: float = 1.453
+    zero_bid_price: float = 0.65
 
 
 @dataclass
@@ -48,8 +52,8 @@ class BiddingStrategy:
     def __init__(self) -> None:
         self._initialized: bool = False
         self._starting_capital: float = 10000.0
+        self._total_init_lots: int = 0
         self._est_total_turns: int = 40
-        self._horizon_exceeded: bool = False
         self._materials: dict[str, _MaterialBidState] = {}
         self._recipes: dict[str, _RecipeTrackState] = {}
         self._init_team_capital: dict[str, float] = {}
@@ -69,33 +73,16 @@ class BiddingStrategy:
             self._update_from_turn_results(state, goods_config, ctx)
 
         if state.turn > self._est_total_turns:
-            # Scenario is longer than our initial guess (e.g. 240-turn extended market):
-            # disable speculative endgame brakes and extend horizon generously.
-            self._horizon_exceeded = True
-            self._est_total_turns = state.turn + 40
+            next_cp = next((cp for cp in _HORIZON_CHECKPOINTS if cp >= state.turn), None)
+            self._est_total_turns = next_cp if next_cp is not None else state.turn + 40
 
-        remaining_turns = (
-            40 if self._horizon_exceeded else max(1, self._est_total_turns - state.turn + 1)
-        )
-        if state.capital <= 1.0 or not state.auction_lots:
+        remaining_turns = max(1, self._est_total_turns - state.turn + 1)
+        if state.capital <= 0.01 or not state.auction_lots:
             self._record_pre_turn_state(state, goods_config, {})
             return []
 
-        # Hard capital-protection circuit breaker in micro-crowded negative-EV rooms
-        # (e.g. 40+ teams on tiny lots where 40/44 teams lose money): if our cash dipped
-        # below starting capital and we already hold finished goods, pause buying until
-        # existing stock converts back into cash.
-        if getattr(ctx, "is_micro_crowded", False):
-            total_fin_held = sum(
-                max(0, int(state.inventory.get(g, 0)))
-                for g in goods_config.finished_goods
-            )
-            if state.capital < self._starting_capital * 0.992 and total_fin_held >= 1:
-                self._record_pre_turn_state(state, goods_config, {})
-                return []
-
         # 1. Rank recipes by expected net margin and determine target batch quantities.
-        recipe_targets, max_material_wtp = self._plan_recipe_material_targets(
+        recipe_targets, max_material_wtp, est_prices = self._plan_recipe_material_targets(
             state, goods_config, ctx, remaining_turns
         )
 
@@ -121,6 +108,14 @@ class BiddingStrategy:
         for mat, sval in ctx_shadows.items():
             if sval > 0:
                 material_priority[mat] = max(material_priority.get(mat, 0.0), float(sval))
+
+        # Precompute opponent-demand total batch cost once per turn.
+        lot_reserves = {lot.good: float(lot.reserve_price) for lot in state.auction_lots}
+        one_batch_need_by_mat = self._compute_one_batch_need(goods_config)
+        one_batch_total_cost = sum(
+            lot_reserves.get(m, 10.0) * one_batch_need_by_mat.get(m, 0)
+            for m in goods_config.raw_materials
+        )
 
         # 3. Price each material lot using the 3-regime descending clearing model.
         planned_bids: dict[str, tuple[int, float, int, float]] = {}
@@ -155,6 +150,9 @@ class BiddingStrategy:
                 goods_config=goods_config,
                 ctx=ctx,
                 remaining_turns=remaining_turns,
+                one_batch_need=one_batch_need_by_mat.get(mat, 0),
+                one_batch_total_cost=one_batch_total_cost,
+                lot_reserves=lot_reserves,
             )
             if adj_qty <= 0 or bid_price < lot.reserve_price or not isfinite(bid_price):
                 continue
@@ -166,17 +164,34 @@ class BiddingStrategy:
                 material_priority.get(mat, 1.0),
             )
 
+        # 3b. Enforce joint recipe-bundle ROI discipline so high multipliers on multiple
+        # inputs never combine to exceed expected finished-good selling prices.
+        planned_bids = self._enforce_bundle_roi_caps(
+            planned_bids=planned_bids,
+            recipe_targets=recipe_targets,
+            est_prices=est_prices,
+            lot_reserves=lot_reserves,
+            state=state,
+            goods_config=goods_config,
+            ctx=ctx,
+        )
+
         # 4. Enforce strict budget cap so random lot clearing order never starves key materials.
         final_bids = self._enforce_budget_cap(
             planned_bids, state, goods_config, ctx, remaining_turns
         )
 
         self._record_pre_turn_state(state, goods_config, final_bids)
-        return [
-            Bid(mat, int(qty), round(float(price), 4))
-            for mat, (qty, price, _regime) in final_bids.items()
-            if qty > 0 and isfinite(price) and price >= 0.0
-        ]
+        out_bids: list[Bid] = []
+        for mat, (qty, price, _regime) in final_bids.items():
+            if qty <= 0 or not isfinite(price) or price < 0.0:
+                continue
+            rprice = lot_reserves.get(mat, 0.0)
+            rounded = round(float(price), 6)
+            if rounded < rprice:
+                rounded = rprice
+            out_bids.append(Bid(mat, int(qty), rounded))
+        return out_bids
 
     # ------------------------------------------------------------------
     # Turn 1 setup & Turn t>=2 learning
@@ -189,10 +204,10 @@ class BiddingStrategy:
         ctx: MarketContext,
     ) -> None:
         self._initialized = True
-        self._horizon_exceeded = False
         self._starting_capital = max(1.0, float(state.capital))
 
         total_initial_lots = sum(max(0, int(lot.quantity)) for lot in state.auction_lots)
+        self._total_init_lots = total_initial_lots
         num_finished = max(1, len(goods_config.finished_goods))
         if num_finished <= 2 and self._starting_capital <= 8000.0:
             self._est_total_turns = 20
@@ -205,7 +220,7 @@ class BiddingStrategy:
         lot_map = {lot.good: lot for lot in state.auction_lots}
         for raw in goods_config.raw_materials:
             lot = lot_map.get(raw)
-            rprice = max(0.01, float(lot.reserve_price)) if lot else 10.0
+            rprice = max(0.0, float(lot.reserve_price)) if lot else 10.0
             base_need = sum(
                 int(r.inputs.get(raw, 0)) for r in goods_config.recipes.values()
             )
@@ -271,10 +286,11 @@ class BiddingStrategy:
 
         # 2. Tally our auction wins from turn t-1.
         won_by_mat: dict[str, int] = {raw: 0 for raw in goods_config.raw_materials}
+        is_own_auc = getattr(ctx, "is_own_auction_tx", None)
         for tx in ctx.new_auction_txs:
             if tx.quantity <= 0:
                 continue
-            if ctx.team_id is None or tx.buyer == ctx.team_id:
+            if is_own_auc(tx) if is_own_auc is not None else (ctx.team_id is not None and tx.buyer == ctx.team_id):
                 won_by_mat[tx.good] = won_by_mat.get(tx.good, 0) + int(tx.quantity)
 
         # 3. Update per-material consumption and auction fill-rate adaptation.
@@ -292,6 +308,13 @@ class BiddingStrategy:
                 reserve_fell = (
                     len(r_hist) >= 2 and r_hist[-1] < r_hist[-2] * 0.995
                 )
+                prev_reserve = r_hist[-2] if len(r_hist) >= 2 else (r_hist[-1] if r_hist else 1.0)
+                if prev_reserve <= 1e-6:
+                    if fill_rate < 0.85 and ms.last_regime >= 2:
+                        step = 1.45 if fill_rate < 0.50 else 1.25
+                        ms.zero_bid_price = max(ms.zero_bid_price, ms.last_bid_price) * step
+                    elif fill_rate >= 0.95 and ms.last_bid_price > 0.0:
+                        ms.zero_bid_price = max(0.10, ms.last_bid_price * 0.94)
 
                 if fill_rate < 0.85:
                     severe = fill_rate < 0.50
@@ -313,10 +336,11 @@ class BiddingStrategy:
 
         # 4. Update per-recipe production & sales tracking.
         sold_by_good: dict[str, int] = {g: 0 for g in goods_config.finished_goods}
+        is_own_sale = getattr(ctx, "is_own_sales_tx", None)
         for stx in ctx.new_sales_txs:
             if stx.quantity <= 0:
                 continue
-            if ctx.team_id is None or stx.seller == ctx.team_id:
+            if is_own_sale(stx) if is_own_sale is not None else (ctx.team_id is not None and stx.seller == ctx.team_id):
                 sold_by_good[stx.good] = sold_by_good.get(stx.good, 0) + int(stx.quantity)
 
         for rname, recipe in goods_config.recipes.items():
@@ -346,8 +370,8 @@ class BiddingStrategy:
         goods_config: GoodsConfig,
         ctx: MarketContext,
         remaining_turns: int,
-    ) -> tuple[dict[str, tuple[int, float]], dict[str, float]]:
-        """Compute `(target_units, unit_margin)` per recipe and `max_wtp` per material."""
+    ) -> tuple[dict[str, tuple[int, float]], dict[str, float], dict[str, float]]:
+        """Compute `(target_units, unit_margin)` per recipe, `max_wtp` per material, and `est_prices`."""
         lot_reserve = {lot.good: float(lot.reserve_price) for lot in state.auction_lots}
         lot_qty_map = {lot.good: int(lot.quantity) for lot in state.auction_lots}
         est_prices = self._estimate_all_good_prices(state, goods_config, ctx)
@@ -363,8 +387,8 @@ class BiddingStrategy:
             sale_p = est_prices.get(g, 150.0)
             est_cost = sum(
                 max(
-                    lot_reserve.get(mat, 1.0),
-                    ctx.avg_material_cost.get(mat, lot_reserve.get(mat, 1.0)),
+                    lot_reserve.get(mat, 0.0),
+                    ctx.avg_material_cost.get(mat, lot_reserve.get(mat, 0.0)),
                 )
                 * int(amt)
                 for mat, amt in recipe.inputs.items()
@@ -377,8 +401,8 @@ class BiddingStrategy:
                     continue
                 other_cost = sum(
                     max(
-                        lot_reserve.get(m, 1.0),
-                        ctx.avg_material_cost.get(m, lot_reserve.get(m, 1.0)),
+                        lot_reserve.get(m, 0.0),
+                        ctx.avg_material_cost.get(m, lot_reserve.get(m, 0.0)),
                     )
                     * int(a)
                     for m, a in recipe.inputs.items()
@@ -397,17 +421,17 @@ class BiddingStrategy:
         unsold_map = getattr(ctx, "own_unsold_streak", {})
         sales_count_map = getattr(ctx, "sales_count_by_good", {})
         crowding_map = getattr(ctx, "crowding_ratio_by_good", {})
+        supply_per_team = float(getattr(ctx, "supply_per_team", 10.0))
         is_crowded = bool(getattr(ctx, "is_crowded_tournament", False))
-        is_micro_crowded = bool(getattr(ctx, "is_micro_crowded", False))
         is_expansion = bool(getattr(ctx, "is_high_volume_expansion", False))
         is_blitz = bool(getattr(ctx, "is_blitz_window", False))
         est_cap = getattr(ctx, "estimated_capacity_per_turn", None)
         remaining_cap = int(est_cap) if est_cap is not None and est_cap > 0 else None
         covered_goods: set[str] = set()
 
-        # Identify top-2 highest-margin unique goods for blitz / micro-crowded focus.
+        # Identify top-2 highest-margin unique goods for blitz focus.
         blitz_top_goods: set[str] = set()
-        if (is_blitz or is_micro_crowded) and num_finished > 1:
+        if is_blitz and num_finished > 1:
             for m_val, rn in ranked_recipes:
                 if m_val <= 0.0:
                     continue
@@ -465,17 +489,14 @@ class BiddingStrategy:
             else:
                 # Multi-good market: align with `production.py` target shelf stocks & velocity.
                 crowding = float(crowding_map.get(g, 0.0))
-                if is_micro_crowded:
-                    # Micro-crowded negative-EV regime (e.g. 40+ teams on tiny lots):
-                    # protect capital! Only snipe tiny batches of top-2 uncrowded goods.
-                    if g not in blitz_top_goods or crowding > 0.35 or unsold >= 1 or curr_fin >= 2:
-                        desired_total = curr_fin
-                    else:
+                if is_blitz and g in blitz_top_goods and unsold == 0:
+                    if supply_per_team < 1.8:
+                        # Hyper-scarce lottery rooms (<1.8 units/team): don't over-order unmatched parts.
                         desired_total = max(1, min(2, int(ceil(vel * 1.1 + 0.5))))
-                elif is_blitz and g in blitz_top_goods and unsold == 0:
-                    # Calibrated early blitz: build strong monopoly batch on top-2 goods.
-                    blitz_target = max(4, min(6, rt.inferred_prod_cap + 3))
-                    desired_total = max(blitz_target, int(ceil(vel * 1.8 + 2.0)))
+                    else:
+                        # Calibrated early blitz: build strong monopoly batch on top-2 goods.
+                        blitz_target = max(4, min(6, rt.inferred_prod_cap + 3))
+                        desired_total = max(blitz_target, int(ceil(vel * 1.8 + 2.0)))
                 elif is_blitz and num_finished > 2 and g not in blitz_top_goods:
                     # During blitz, focus budget on top-2 high-tier goods; skip crowded low-tier.
                     desired_total = curr_fin
@@ -501,8 +522,10 @@ class BiddingStrategy:
                     flow_mult = 1.65 if is_expansion else 1.30
                     desired_total = max(1, int(ceil(vel * flow_mult + (2.0 if is_expansion else 0.5))))
 
-            # Endgame taper: never buy materials for more units than remaining turns can absorb.
-            if remaining_turns <= 4:
+            # Endgame taper: avoid aggressive cutoffs at uncertain early checkpoints past turn 40,
+            # while still tapering at the true end of each checkpoint window.
+            taper_window = 2 if state.turn > 40 else 4
+            if remaining_turns <= taper_window:
                 eff_vel = max(0.8, vel) if total_sold > 0 else 0.5
                 if remaining_turns == 1:
                     endgame_max = int(eff_vel * 0.85) if curr_fin == 0 else 0
@@ -513,12 +536,48 @@ class BiddingStrategy:
                 desired_total = min(desired_total, endgame_max)
 
             net_u = max(0, desired_total - curr_fin)
+            if net_u > 0 and recipe.inputs:
+                # Never target more recipe sets than existing raw + total lot supply can support.
+                phys_cap = min(
+                    (max(0, int(state.inventory.get(m, 0))) + lot_qty_map.get(m, 0))
+                    // max(1, int(amt))
+                    for m, amt in recipe.inputs.items()
+                )
+                net_u = min(net_u, max(0, phys_cap))
+
+                # In crowded markets, condition complementary purchases on bottleneck fill rates
+                # so we don't accumulate unmatched secondary materials when the bottleneck stalls.
+                if is_crowded and state.turn >= 2 and net_u > 0:
+                    achievable = net_u
+                    for m, amt in recipe.inputs.items():
+                        amt_i = max(1, int(amt))
+                        curr_m = max(0, int(state.inventory.get(m, 0)))
+                        lot_m = lot_qty_map.get(m, 0)
+                        ms_m = self._materials.get(m)
+                        fill_m = ms_m.ema_fill_rate if ms_m is not None else 0.65
+                        if fill_m < 0.38:
+                            est_won = int(ceil(lot_m * min(1.0, fill_m * 1.45)))
+                            if supply_per_team >= 1.8 and lot_m >= amt_i and fill_m >= 0.15:
+                                est_won = max(amt_i, est_won)
+                            achievable = min(achievable, (curr_m + est_won) // amt_i)
+                    net_u = min(net_u, max(0, achievable))
+
+                # Ultra-scarce rooms (<1.6 total lot units per team): only pursue recipes where
+                # at most 2 distinct input materials are missing, avoiding 4-way partial-fill losses.
+                if is_crowded and supply_per_team < 1.6 and net_u > 0:
+                    missing_mats = sum(
+                        1 for m, amt in recipe.inputs.items()
+                        if max(0, int(state.inventory.get(m, 0))) < max(1, int(amt))
+                    )
+                    if missing_mats > 2:
+                        net_u = 0
+
             if remaining_cap is not None:
                 net_u = min(net_u, remaining_cap)
                 remaining_cap -= net_u
             recipe_targets[rname] = (net_u, margin)
 
-        return recipe_targets, max_material_wtp
+        return recipe_targets, max_material_wtp, est_prices
 
     def _estimate_all_good_prices(
         self,
@@ -526,28 +585,39 @@ class BiddingStrategy:
         goods_config: GoodsConfig,
         ctx: MarketContext,
     ) -> dict[str, float]:
-        """Return estimated sale price for every finished good."""
+        """Return estimated sale price for every finished good (cheapest recipe per good)."""
+        raw_costs: dict[str, float] = {}
         init_costs: dict[str, float] = {}
         input_counts: dict[str, int] = {}
-        for rname, recipe in goods_config.recipes.items():
+        for recipe in goods_config.recipes.values():
             g = recipe.output_good
             c = sum(
                 self._materials[mat].init_reserve * int(amt)
                 for mat, amt in recipe.inputs.items()
                 if mat in self._materials
             )
-            u = sum(int(amt) for amt in recipe.inputs.values())
-            init_costs[g] = max(0.5, c)
-            input_counts[g] = max(1, u)
+            u = max(1, sum(int(amt) for amt in recipe.inputs.values()))
+            if g not in raw_costs or c < raw_costs[g] or (abs(c - raw_costs[g]) < 1e-6 and u < input_counts[g]):
+                raw_costs[g] = max(0.0, c)
+                init_costs[g] = max(0.01, c)
+                input_counts[g] = u
 
         c_min = min(init_costs.values()) if init_costs else 1.0
         c_max = max(init_costs.values()) if init_costs else 1.0
+        max_raw_cost = max(raw_costs.values()) if raw_costs else 0.0
         u_min = min(input_counts.values()) if input_counts else 1
         u_max = max(input_counts.values()) if input_counts else 1
         num_finished = len(goods_config.finished_goods)
 
         est: dict[str, float] = {}
-        nominal_materials = c_max < self._starting_capital * 0.002
+        nominal_materials = (
+            (max_raw_cost <= 0.05 and self._starting_capital >= 500.0)
+            or (
+                max_raw_cost <= 3.0
+                and self._starting_capital >= 1000.0
+                and self._total_init_lots >= 300
+            )
+        )
         for g in goods_config.finished_goods:
             icost = init_costs.get(g, 25.0)
             iunits = input_counts.get(g, 2)
@@ -571,6 +641,83 @@ class BiddingStrategy:
     # 3-Regime Pay-Your-Bid Clearing Price Model
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _compute_one_batch_need(goods_config: GoodsConfig) -> dict[str, int]:
+        """Baseline batch demand per material taking max across alternative recipes per good."""
+        per_good: dict[str, dict[str, int]] = {}
+        for recipe in goods_config.recipes.values():
+            g = recipe.output_good
+            g_map = per_good.setdefault(g, {})
+            for m, amt in recipe.inputs.items():
+                amt_i = int(amt)
+                if amt_i > g_map.get(m, 0):
+                    g_map[m] = amt_i
+        totals: dict[str, int] = {m: 0 for m in goods_config.raw_materials}
+        for g_map in per_good.values():
+            for m, amt_i in g_map.items():
+                totals[m] = totals.get(m, 0) + amt_i
+        return totals
+
+    def _enforce_bundle_roi_caps(
+        self,
+        planned_bids: dict[str, tuple[int, float, int, float]],
+        recipe_targets: dict[str, tuple[int, float]],
+        est_prices: dict[str, float],
+        lot_reserves: dict[str, float],
+        state: Observation,
+        goods_config: GoodsConfig,
+        ctx: MarketContext,
+    ) -> dict[str, tuple[int, float, int, float]]:
+        """Scale down bids if combined recipe input bids violate safe output ROI."""
+        if not planned_bids:
+            return planned_bids
+
+        active_recipes = [
+            (rname, goods_config.recipes[rname])
+            for rname, (qty, _m) in recipe_targets.items()
+            if qty > 0 and rname in goods_config.recipes
+        ]
+        if not active_recipes:
+            return planned_bids
+
+        mat_max_allowed: dict[str, float] = {}
+        for rname, recipe in active_recipes:
+            sale_p = est_prices.get(recipe.output_good, 0.0)
+            if sale_p <= 0.0:
+                continue
+            max_allowed_bundle = sale_p * 0.88
+            bid_cost = 0.0
+            other_cost = 0.0
+            for m, amt in recipe.inputs.items():
+                amt_i = max(1, int(amt))
+                if m in planned_bids:
+                    bid_cost += planned_bids[m][1] * amt_i
+                else:
+                    other_cost += lot_reserves.get(m, ctx.avg_material_cost.get(m, 0.0)) * amt_i
+            if bid_cost <= 1e-9:
+                continue
+            if bid_cost + other_cost <= max_allowed_bundle:
+                scale = 1.0
+            else:
+                avail_for_bids = max(0.0, max_allowed_bundle - other_cost)
+                scale = avail_for_bids / bid_cost
+            for m in recipe.inputs:
+                if m in planned_bids:
+                    allowed_p = planned_bids[m][1] * scale
+                    if m not in mat_max_allowed or allowed_p > mat_max_allowed[m]:
+                        mat_max_allowed[m] = allowed_p
+
+        filtered: dict[str, tuple[int, float, int, float]] = {}
+        for m, (qty, price, regime, prio) in planned_bids.items():
+            cap = mat_max_allowed.get(m)
+            if cap is not None and price > cap:
+                rprice = lot_reserves.get(m, 0.0)
+                if cap < rprice:
+                    continue
+                price = max(rprice * 1.0005 if rprice > 1e-6 else 0.01, cap)
+            filtered[m] = (qty, price, regime, prio)
+        return filtered
+
     def _compute_optimal_bid(
         self,
         lot,
@@ -580,6 +727,9 @@ class BiddingStrategy:
         goods_config: GoodsConfig,
         ctx: MarketContext,
         remaining_turns: int,
+        one_batch_need: int,
+        one_batch_total_cost: float,
+        lot_reserves: dict[str, float],
     ) -> tuple[float, int, int]:
         """Select optimal `(bid_price, regime, adj_qty)` for `lot`."""
         mat = lot.good
@@ -588,7 +738,7 @@ class BiddingStrategy:
         ms = self._materials[mat]
 
         d_high, d_mid = self._estimate_opponent_demand(
-            mat, rprice, state, goods_config, ctx
+            mat, rprice, state, ctx, one_batch_need, one_batch_total_cost
         )
         d_high_scaled = int(ceil(d_high * ms.demand_scale))
         d_mid_scaled = int(ceil(d_mid * ms.demand_scale))
@@ -596,17 +746,9 @@ class BiddingStrategy:
         free_after_all = max(0, lot_qty - d_high_scaled - d_mid_scaled)
         free_after_high = max(0, lot_qty - d_high_scaled)
 
-        # When reserve_price is 0.0 (e.g. priv_zero_reserve), anchor bidding to a small
-        # positive floor that scales up with market clearing prices / fill-rate feedback.
+        # When reserve_price is 0.0 (e.g. priv_zero_reserve), bid along `ms.zero_bid_price`
+        # rather than compounding `avg_material_cost * high_mult` recursively.
         zero_reserve = rprice <= 1e-6
-        if zero_reserve:
-            eff_rprice = max(
-                0.35,
-                float(ctx.avg_material_cost.get(mat, 0.0)),
-                ms.last_bid_price if ms.ema_fill_rate < 0.85 else 0.0,
-            )
-        else:
-            eff_rprice = rprice
 
         # If the uncontested surplus in the lot already satisfies most of our need
         # (or in a single-good auction where uncontested units are abundant),
@@ -624,24 +766,32 @@ class BiddingStrategy:
             adj_qty = free_after_all
         elif free_after_high >= net_qty:
             regime = 2
-            raw_price = eff_rprice * ms.mid_mult
+            raw_price = (
+                max(0.12, min(max_wtp * 0.35, ms.zero_bid_price * 0.90))
+                if zero_reserve
+                else rprice * ms.mid_mult
+            )
             adj_qty = net_qty
         else:
             regime = 3
-            if getattr(ctx, "is_blitz_window", False):
-                # Calibrated early blitz: outbid cautious 1.3x-1.8x rivals on bottlenecks,
-                # while keeping strict economic discipline via `blitz_wtp_cap = 0.55`.
+            if zero_reserve:
+                raw_price = max(0.20, min(max_wtp * 0.45, ms.zero_bid_price))
+            elif getattr(ctx, "is_blitz_window", False):
                 blitz_mult = max(ms.high_mult, 2.25)
-                raw_price = eff_rprice * blitz_mult
+                raw_price = rprice * blitz_mult
             else:
-                raw_price = eff_rprice * ms.high_mult
+                raw_price = rprice * ms.high_mult
             adj_qty = net_qty
 
         # On the final turn, avoid paying high-contest premiums.
         if remaining_turns == 1 and regime == 3 and len(goods_config.finished_goods) > 1:
             if free_after_high > 0:
                 regime = 2
-                raw_price = eff_rprice * ms.mid_mult
+                raw_price = (
+                    max(0.12, ms.zero_bid_price * 0.90)
+                    if zero_reserve
+                    else rprice * ms.mid_mult
+                )
                 adj_qty = min(net_qty, free_after_high)
             else:
                 return -1.0, regime, 0
@@ -662,43 +812,38 @@ class BiddingStrategy:
         mat: str,
         rprice: float,
         state: Observation,
-        goods_config: GoodsConfig,
         ctx: MarketContext,
+        one_batch_need: int,
+        one_batch_total_cost: float,
     ) -> tuple[int, int]:
         """Estimate `(d_high, d_mid)` opponent demand for `mat` from public state."""
-        one_batch_need = sum(
-            int(recipe.inputs.get(mat, 0))
-            for recipe in goods_config.recipes.values()
-        )
         if one_batch_need <= 0:
             return 0, 0
 
+        turn = state.turn
+        active_opps = self._active_opponents
+        own_id = ctx.team_id
+        pub_cap = state.public_capital
         opp_ids = [
             tid
             for tid in state.public_inventories
-            if (ctx.team_id is None or tid != ctx.team_id)
-            and (state.turn == 1 or tid in self._active_opponents)
-            and state.public_capital.get(tid, 0.0) > rprice
+            if (own_id is None or tid != own_id)
+            and (turn == 1 or tid in active_opps)
+            and pub_cap.get(tid, 0.0) > rprice
         ]
         if not opp_ids:
             return 0, 0
 
-        lot_reserves = {lot.good: float(lot.reserve_price) for lot in state.auction_lots}
-        one_batch_total_cost = sum(
-            lot_reserves.get(m, 10.0)
-            * sum(int(r.inputs.get(m, 0)) for r in goods_config.recipes.values())
-            for m in goods_config.raw_materials
-        )
-
         demands: list[tuple[int, int]] = []
+        planned_4x_cost = 4.0 * one_batch_total_cost * 1.45
+        pub_invs = state.public_inventories
         for tid in opp_ids:
-            inv_m = max(0, int(state.public_inventories.get(tid, {}).get(mat, 0)))
-            cap = max(0.0, float(state.public_capital.get(tid, 0.0)))
+            inv_m = max(0, int(pub_invs.get(tid, {}).get(mat, 0)))
+            cap = max(0.0, float(pub_cap.get(tid, 0.0)))
 
             mid_need = max(0, one_batch_need - inv_m)
             raw_high_need = max(0, 4 * one_batch_need - inv_m)
             if one_batch_total_cost > 0:
-                planned_4x_cost = 4.0 * one_batch_total_cost * 1.45
                 budget = 0.60 * cap
                 scale = min(1.0, budget / planned_4x_cost) if planned_4x_cost > budget else 1.0
                 high_need = int(raw_high_need * scale)
@@ -731,13 +876,9 @@ class BiddingStrategy:
             return {}
 
         is_crowded = bool(getattr(ctx, "is_crowded_tournament", False))
-        is_micro_crowded = bool(getattr(ctx, "is_micro_crowded", False))
         is_expansion = bool(getattr(ctx, "is_high_volume_expansion", False))
         is_blitz = bool(getattr(ctx, "is_blitz_window", False))
-        if is_micro_crowded:
-            # Capital preservation in hyper-crowded tiny-lot rooms (e.g. 44-team default).
-            budget_share = 0.14
-        elif is_blitz and state.turn <= 4:
+        if is_blitz and state.turn <= 4:
             budget_share = 0.85
         elif is_expansion and remaining_turns > 3:
             budget_share = 0.82
@@ -750,7 +891,7 @@ class BiddingStrategy:
 
         # Post-blitz stop-loss in crowded tournament rooms: protect cash when shelf
         # inventory grows faster than sales velocity.
-        if is_crowded and not is_blitz and not is_micro_crowded and remaining_turns > 2:
+        if is_crowded and not is_blitz and remaining_turns > 2:
             total_fin_inv = sum(
                 max(0, int(state.inventory.get(g, 0)))
                 for g in goods_config.finished_goods
@@ -782,18 +923,32 @@ class BiddingStrategy:
             key=lambda item: item[1][3],
             reverse=True,
         )
+        # First pass: proportional floored allocation so complementary materials aren't starved.
         for mat, (qty, price, regime, _prio) in ordered:
             if price <= 0:
+                scaled[mat] = (qty, price, regime)
                 continue
             rem_budget = max_budget - running_spend
             max_affordable = int(rem_budget // price)
             if max_affordable <= 0:
                 continue
-            target_q = max(1, int(qty * scale))
+            target_q = int(qty * scale)
             final_q = min(qty, target_q, max_affordable)
             if final_q > 0:
                 scaled[mat] = (final_q, price, regime)
                 running_spend += final_q * price
+
+        # Second pass: spend leftover budget (+1 unit at a time in priority order).
+        for mat, (qty, price, regime, _prio) in ordered:
+            if price <= 0:
+                continue
+            cur_q = scaled[mat][0] if mat in scaled else 0
+            if cur_q >= qty:
+                continue
+            rem_budget = max_budget - running_spend
+            if rem_budget >= price:
+                scaled[mat] = (cur_q + 1, price, regime)
+                running_spend += price
 
         return scaled
 

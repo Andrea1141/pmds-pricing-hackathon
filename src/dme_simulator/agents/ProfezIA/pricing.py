@@ -15,6 +15,9 @@ from dme_simulator.config import GoodsConfig
 from .state import MarketContext
 
 
+_HORIZON_CHECKPOINTS = (20, 30, 40, 50, 60, 80, 100, 120, 150, 180, 200, 240)
+
+
 @dataclass
 class _GoodPricingState:
     """Internal per-good state for dynamic WTP discovery and inventory pacing."""
@@ -44,7 +47,6 @@ class PricingStrategy:
         self._initialized: bool = False
         self._starting_capital: float = 10000.0
         self._est_total_turns: int = 40
-        self._horizon_exceeded: bool = False
         self._init_reserve: dict[str, float] = {}
         self._goods: dict[str, _GoodPricingState] = {}
         self._good_to_recipes: dict[str, list[str]] = {}
@@ -61,24 +63,22 @@ class PricingStrategy:
         else:
             self._update_from_turn_results(state, goods_config, ctx)
 
-        # If a private scenario runs longer than our initial estimate (e.g. 240-turn
-        # extended market), rebound anchors once and disable speculative endgame discounts
-        # so we rely on inventory_cover pacing instead of firing fake endgame fire-sales.
+        # Advance horizon along standard tournament checkpoints and rebound anchors
+        # after crossing a checkpoint so 60/80/240-turn matches still clear at the end.
         if state.turn > self._est_total_turns:
-            if not self._horizon_exceeded:
-                for gp in self._goods.values():
-                    if gp.has_ever_sold:
-                        gp.anchor_price = max(
-                            gp.anchor_price * 1.18,
-                            gp.ema_sold_price * 1.12,
-                            gp.max_sold_price * 0.94,
-                        )
-            self._horizon_exceeded = True
-            self._est_total_turns = state.turn + 40
+            next_cp = next((cp for cp in _HORIZON_CHECKPOINTS if cp >= state.turn), None)
+            self._est_total_turns = next_cp if next_cp is not None else state.turn + 40
+            for gp in self._goods.values():
+                if gp.has_ever_sold:
+                    gp.anchor_price = max(
+                        gp.anchor_price * 1.18,
+                        gp.ema_sold_price * 1.12,
+                        gp.max_sold_price * 0.94,
+                    )
+                    if gp.price_ceiling > 0.0:
+                        gp.price_ceiling = max(gp.price_ceiling, gp.anchor_price * 1.08)
 
-        remaining_turns = (
-            40 if self._horizon_exceeded else max(1, self._est_total_turns - state.turn + 1)
-        )
+        remaining_turns = max(1, self._est_total_turns - state.turn + 1)
         min_prod, exp_prod, max_prod = self._estimate_current_production(
             state, goods_config, ctx
         )
@@ -86,10 +86,9 @@ class PricingStrategy:
         is_crowded = bool(
             getattr(ctx, "is_crowded_tournament", len(state.public_capital) >= 10)
         )
-        is_micro_crowded = bool(getattr(ctx, "is_micro_crowded", False))
         is_expansion = bool(getattr(ctx, "is_high_volume_expansion", False))
         is_blitz = bool(
-            getattr(ctx, "is_blitz_window", is_crowded and not is_micro_crowded and state.turn <= 6)
+            getattr(ctx, "is_blitz_window", is_crowded and state.turn <= 6)
         )
         sellers_map = getattr(ctx, "competitor_sellers_by_good", {})
         crowding_map = getattr(ctx, "crowding_ratio_by_good", {})
@@ -154,7 +153,6 @@ class PricingStrategy:
                 comp_sellers=comp_sellers,
                 crowding=crowding,
                 is_crowded=is_crowded,
-                is_micro_crowded=is_micro_crowded,
                 is_expansion=is_expansion,
                 is_blitz=is_blitz,
                 base_anchor=base_anchor,
@@ -170,7 +168,9 @@ class PricingStrategy:
 
             for qty, price, _role in good_tiers:
                 if qty > 0 and isfinite(price) and price > 0:
-                    listings.append(Listing(good, int(qty), round(float(price), 2)))
+                    decimals = 4 if price < 5.0 else 2
+                    rounded = max(0.01, round(float(price), decimals))
+                    listings.append(Listing(good, int(qty), rounded))
 
         return listings
 
@@ -185,7 +185,6 @@ class PricingStrategy:
         ctx: MarketContext | None = None,
     ) -> None:
         self._initialized = True
-        self._horizon_exceeded = False
         self._starting_capital = max(1.0, float(state.capital))
         self._init_reserve = {
             lot.good: max(0.0, float(lot.reserve_price))
@@ -239,7 +238,14 @@ class PricingStrategy:
             else 2.0
         )
         max_raw_cost = max(raw_init_costs.values()) if raw_init_costs else 0.0
-        nominal_cost_regime = max_raw_cost < self._starting_capital * 0.002
+        nominal_cost_regime = (
+            (max_raw_cost <= 0.05 and self._starting_capital >= 500.0)
+            or (
+                max_raw_cost <= 3.0
+                and self._starting_capital >= 1000.0
+                and total_initial_lot_units >= 300
+            )
+        )
 
         eff_costs: dict[str, float] = {}
         for good in goods_config.finished_goods:
@@ -254,7 +260,7 @@ class PricingStrategy:
                         (self._starting_capital * 0.0045) * (iu / max(1.0, avg_units)),
                     )
             else:
-                eff_costs[good] = max(0.5, rc)
+                eff_costs[good] = max(0.01, rc)
 
         c_min = min(eff_costs.values()) if eff_costs else 1.0
         c_max = max(eff_costs.values()) if eff_costs else 1.0
@@ -263,7 +269,7 @@ class PricingStrategy:
 
         self._goods.clear()
         for good in goods_config.finished_goods:
-            icost = max(0.5, raw_init_costs[good])
+            icost = max(0.01, raw_init_costs[good])
             ecost = eff_costs[good]
             iunits = input_counts[good]
 
@@ -310,10 +316,16 @@ class PricingStrategy:
         }
         comp_max_price: dict[str, float] = {}
 
+        is_own_sale = getattr(ctx, "is_own_sales_tx", None)
         for tx in ctx.new_sales_txs:
             if tx.quantity <= 0 or tx.price <= 0:
                 continue
-            if ctx.team_id is None or tx.seller == ctx.team_id:
+            own_tx = (
+                is_own_sale(tx)
+                if is_own_sale is not None
+                else (ctx.team_id is not None and tx.seller == ctx.team_id)
+            )
+            if own_tx:
                 our_txs_by_good.setdefault(tx.good, []).append(
                     (int(tx.quantity), float(tx.price))
                 )
@@ -409,7 +421,7 @@ class PricingStrategy:
                     else:
                         gp.price_ceiling *= 1.015
 
-                if not competitor_dumped and sold_qty >= 3:
+                if not competitor_dumped and demand_heat >= 0.72 and sold_qty >= 3:
                     failed_above = [
                         tp
                         for off_q, tp, role in offered_tiers
@@ -447,7 +459,12 @@ class PricingStrategy:
                         gp.anchor_price * 1.025,
                         0.40 * gp.anchor_price + 0.60 * max_tx_price * 1.03,
                     )
-                elif is_crowded and (crowding >= 0.40 or comp_sellers >= 4) and curr_inv >= 2 and sold_qty < target_velocity:
+                elif (
+                    is_crowded
+                    and (crowding >= 0.40 or (comp_sellers >= 4 and inventory_cover >= 1.35))
+                    and curr_inv >= 2
+                    and sold_qty < target_velocity
+                ):
                     # Objective 3: Fast clearance in crowded 38-team goods before price war deepens.
                     gp.sold_out_streak = 0
                     ref_price = 0.45 * avg_tx_price + 0.55 * min_tx_price
@@ -524,7 +541,6 @@ class PricingStrategy:
         comp_sellers: int,
         crowding: float,
         is_crowded: bool,
-        is_micro_crowded: bool,
         is_expansion: bool,
         is_blitz: bool,
         base_anchor: float,
@@ -540,7 +556,8 @@ class PricingStrategy:
         inventory_cover = curr_inv / max(0.5, gp.ema_sales)
 
         endgame_discount = 1.0
-        if is_crowded and remaining_turns <= 6 and curr_inv >= 1:
+        crowded_eg_window = 3 if turn > 40 else 6
+        if is_crowded and remaining_turns <= crowded_eg_window and curr_inv >= 1:
             if remaining_turns == 6 and curr_inv >= 3:
                 endgame_discount = 0.92
             elif remaining_turns == 5 and curr_inv >= 2:
@@ -553,14 +570,14 @@ class PricingStrategy:
                 endgame_discount = 0.70 if stock_to_plan > 1 else 0.80
             elif remaining_turns == 1:
                 endgame_discount = 0.58 if stock_to_plan > 1 else 0.68
-        elif remaining_turns <= 3:
+        elif remaining_turns <= (2 if turn > 40 else 3):
             if remaining_turns == 3 and (stock_to_plan > ceil(gp.ema_sales * 1.5) or curr_inv >= 2):
                 endgame_discount = 0.88
             elif remaining_turns == 2:
                 endgame_discount = 0.80 if stock_to_plan > 1 else 0.88
             elif remaining_turns == 1:
                 endgame_discount = 0.68 if stock_to_plan > 1 else 0.76
-        elif is_crowded and crowding >= 0.40 and curr_inv >= 2:
+        elif is_crowded and (crowding >= 0.40 or (comp_sellers >= 4 and inventory_cover >= 1.35)) and curr_inv >= 2:
             # Objective 3: Proactive clearance discount on crowded goods with shelf backlog.
             endgame_discount = max(0.80, 0.93 - 0.03 * min(4, curr_inv))
         elif inventory_cover > 2.6 and curr_inv >= 3:
@@ -605,8 +622,9 @@ class PricingStrategy:
         tiers: list[tuple[int, float, str]] = []
 
         crowded_clearance = (
-            (is_crowded and (crowding >= 0.40 or comp_sellers >= 4) and curr_inv >= 2)
-            or (is_micro_crowded and curr_inv >= 1)
+            is_crowded
+            and (crowding >= 0.40 or (comp_sellers >= 4 and inventory_cover >= 1.35))
+            and curr_inv >= 2
         )
         wide_multi_segment = (
             crowded_clearance
@@ -689,9 +707,10 @@ class PricingStrategy:
     ) -> tuple[dict[str, int], dict[str, int], dict[str, int]]:
         """Simulate `ctx.planned_assembly` under 0%, expected, and 100% bid fill rates."""
         lot_caps = {lot.good: max(0, int(lot.quantity)) for lot in state.auction_lots}
+        lot_reserves = {lot.good: float(lot.reserve_price) for lot in state.auction_lots}
         bid_map: dict[str, int] = {}
         for bid in ctx.planned_bids:
-            if bid.quantity > 0:
+            if bid.quantity > 0 and bid.price_per_unit >= lot_reserves.get(bid.good, 0.0) - 1e-9:
                 cap = lot_caps.get(bid.good, bid.quantity)
                 bid_map[bid.good] = min(cap, bid_map.get(bid.good, 0) + int(bid.quantity))
 
@@ -774,7 +793,7 @@ class PricingStrategy:
 
         if not isfinite(best_cost):
             best_cost = gp.init_cost
-        return max(0.5, best_cost, gp.init_cost * 0.75)
+        return max(0.01, best_cost, gp.init_cost * 0.75)
 
     @staticmethod
     def _compute_cost_floor(
@@ -785,12 +804,12 @@ class PricingStrategy:
         is_crowded: bool = False,
     ) -> float:
         if remaining_turns <= 1 and curr_inv > 0:
-            return max(1.0, unit_cost * (0.45 if is_crowded else 0.60))
+            return max(0.02, unit_cost * (0.45 if is_crowded else 0.60))
         if remaining_turns == 2 and curr_inv >= 1:
-            return max(1.0, unit_cost * (0.70 if is_crowded else 0.82))
+            return max(0.02, unit_cost * (0.70 if is_crowded else 0.82))
         if is_crowded and remaining_turns <= 4 and curr_inv >= 2:
-            return max(1.0, unit_cost * 0.88)
-        return max(1.0, unit_cost * 1.12)
+            return max(0.02, unit_cost * 0.88)
+        return max(0.02, unit_cost * 1.12)
 
     @staticmethod
     def _competitor_finished_stock(
