@@ -12,6 +12,7 @@ Converts raw materials into finished goods using:
 from __future__ import annotations
 
 from math import ceil
+from time import perf_counter
 
 from dme_simulator.agents import AssemblyOrder, Observation
 from dme_simulator.config import GoodsConfig
@@ -24,6 +25,7 @@ class ProductionStrategy:
 
     _MAX_GREEDY_STEPS = 80
     _MAX_SWAP_ITERS = 30
+    _MAX_LOCAL_SEARCH_SEC = 0.012
 
     def __init__(self) -> None:
         pass
@@ -168,7 +170,7 @@ class ProductionStrategy:
 
         # Market-scale baseline per finished good per team (adapts to default vs scaled_market).
         est_market_good_units = total_lot_units / max(1.0, avg_inputs * team_count * num_goods)
-        market_probe = max(2, min(15, ceil(est_market_good_units * 1.4)))
+        market_probe = max(2, min(40, ceil(est_market_good_units * 1.4)))
 
         targets: dict[str, int] = {}
         for good in goods_config.finished_goods:
@@ -181,6 +183,8 @@ class ProductionStrategy:
             if sold_count == 0:
                 # Untested good: keep a modest probe target unless stock is already sitting unsold.
                 if unsold >= 2:
+                    targets[good] = 0
+                elif unsold == 1:
                     targets[good] = 1
                 else:
                     targets[good] = max(1, min(market_probe, 4))
@@ -189,10 +193,13 @@ class ProductionStrategy:
                 ramp = max(vel * (1.8 + 0.3 * min(stockouts, 3)) + 2.0, last_sold * 1.5 + 1.0)
                 targets[good] = max(market_probe, ceil(ramp))
             elif unsold >= 2:
-                # Sitting unsold for multiple turns: throttle down sharply.
-                targets[good] = max(1, ceil(vel * 0.8))
+                # Sitting unsold for multiple turns: stop building until shelf clears.
+                targets[good] = max(0, int(vel * 0.5))
+            elif unsold == 1:
+                # Single unsold turn: hold steady around velocity without over-building.
+                targets[good] = max(1, ceil(vel * 1.0))
             else:
-                targets[good] = max(market_probe, ceil(vel * 1.6 + 1.0))
+                targets[good] = max(market_probe, ceil(vel * 1.45 + 1.0))
         return targets
 
     def _compute_material_weights(
@@ -284,10 +291,13 @@ class ProductionStrategy:
         target = target_stock.get(good, 2)
         if current_good_qty >= target:
             excess = current_good_qty - target + 1
-            soft_ceiling = max(target * 2 + 2, target + 4)
+            if unsold_streak >= 1:
+                soft_ceiling = target + 1
+            else:
+                soft_ceiling = max(target * 2 + 1, target + 3)
             if current_good_qty >= soft_ceiling:
                 return 0.0
-            base_value *= 0.45 ** excess
+            base_value *= 0.40 ** excess
 
         return base_value
 
@@ -448,7 +458,10 @@ class ProductionStrategy:
             return False
 
         any_improved = False
+        deadline = perf_counter() + self._MAX_LOCAL_SEARCH_SEC
         for _ in range(self._MAX_SWAP_ITERS):
+            if perf_counter() >= deadline:
+                break
             best_gain = 1e-6
             best_move: tuple[str, list[str]] | None = None
 

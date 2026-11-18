@@ -206,6 +206,10 @@ def _build_private_stress_scenarios(
     )
     crowded_cfg.validate()
 
+    # 7. Long 60-turn scenario (tests horizon assumptions & late-game drift).
+    long60_cfg = replace(base, turns=60, seed=77)
+    long60_cfg.validate()
+
     return [
         ("priv_multi_recipe", multi_recipe_cfg, default_path, "default"),
         ("priv_bottleneck", bottleneck_cfg, default_path, "default"),
@@ -213,6 +217,7 @@ def _build_private_stress_scenarios(
         ("priv_wave_crash", wave_crash_cfg, default_path, "default"),
         ("priv_zero_reserve", zero_reserve_cfg, default_path, "default"),
         ("priv_crowded_8", crowded_cfg, default_path, "crowded"),
+        ("priv_long_60", long60_cfg, default_path, "default"),
     ]
 
 

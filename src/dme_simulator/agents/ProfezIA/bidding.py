@@ -67,8 +67,9 @@ class BiddingStrategy:
         else:
             self._update_from_turn_results(state, goods_config, ctx)
 
-        if state.turn >= self._est_total_turns:
-            self._est_total_turns = state.turn + 2
+        if state.turn > self._est_total_turns:
+            # Scenario is longer than estimated: extend generously to exit endgame mode.
+            self._est_total_turns = state.turn + 15
 
         remaining_turns = max(1, self._est_total_turns - state.turn + 1)
         if state.capital <= 1.0 or not state.auction_lots:
@@ -274,14 +275,22 @@ class BiddingStrategy:
                 )
 
                 if fill_rate < 0.85:
-                    ms.demand_scale = min(1.65, ms.demand_scale + 0.22)
+                    severe = fill_rate < 0.50
+                    ms.demand_scale = min(
+                        2.40, ms.demand_scale + (0.35 if severe else 0.22)
+                    )
                     if ms.last_regime == 2:
-                        ms.mid_mult = min(1.38, ms.mid_mult + 0.015)
+                        ms.mid_mult = min(
+                            1.70, ms.mid_mult + (0.04 if severe else 0.02)
+                        )
                     elif ms.last_regime == 3:
-                        ms.high_mult = min(1.65, ms.high_mult + 0.035)
+                        ms.high_mult = min(
+                            2.60, ms.high_mult + (0.08 if severe else 0.04)
+                        )
                 elif fill_rate >= 0.99 and reserve_fell:
                     ms.demand_scale = max(0.70, ms.demand_scale * 0.92)
-                    ms.high_mult = max(1.453, ms.high_mult * 0.99)
+                    ms.mid_mult = max(1.303, ms.mid_mult * 0.99)
+                    ms.high_mult = max(1.453, ms.high_mult * 0.985)
 
         # 4. Update per-recipe production & sales tracking.
         sold_by_good: dict[str, int] = {g: 0 for g in goods_config.finished_goods}
@@ -378,6 +387,9 @@ class BiddingStrategy:
         stockout_map = getattr(ctx, "own_stockout_streak", {})
         unsold_map = getattr(ctx, "own_unsold_streak", {})
         sales_count_map = getattr(ctx, "sales_count_by_good", {})
+        est_cap = getattr(ctx, "estimated_capacity_per_turn", None)
+        remaining_cap = int(est_cap) if est_cap is not None and est_cap > 0 else None
+        covered_goods: set[str] = set()
 
         for margin, rname in ranked_recipes:
             recipe = goods_config.recipes[rname]
@@ -385,12 +397,17 @@ class BiddingStrategy:
             g = recipe.output_good
             curr_fin = max(0, int(state.inventory.get(g, 0)))
 
-            if margin <= 0.0 or rt is None:
+            # On multi-recipe goods, only plan material purchases for the highest-margin recipe.
+            if margin <= 0.0 or rt is None or g in covered_goods:
                 recipe_targets[rname] = (0, 0.0)
                 continue
+            covered_goods.add(g)
 
             if rt.is_hard_capped:
                 target_u = max(0, rt.inferred_prod_cap - curr_fin)
+                if remaining_cap is not None:
+                    target_u = min(target_u, remaining_cap)
+                    remaining_cap -= target_u
                 recipe_targets[rname] = (target_u, margin)
                 continue
 
@@ -451,6 +468,9 @@ class BiddingStrategy:
                 desired_total = min(desired_total, endgame_max)
 
             net_u = max(0, desired_total - curr_fin)
+            if remaining_cap is not None:
+                net_u = min(net_u, remaining_cap)
+                remaining_cap -= net_u
             recipe_targets[rname] = (net_u, margin)
 
         return recipe_targets, max_material_wtp
@@ -482,19 +502,21 @@ class BiddingStrategy:
         num_finished = len(goods_config.finished_goods)
 
         est: dict[str, float] = {}
+        nominal_materials = c_max < self._starting_capital * 0.002
         for g in goods_config.finished_goods:
             icost = init_costs.get(g, 25.0)
             iunits = input_counts.get(g, 2)
-            if num_finished > 1 and (c_max - c_min > 1e-6 or u_max > u_min):
+            r_units = (iunits - u_min) / max(1e-6, float(u_max - u_min))
+            if nominal_materials:
+                # Free / near-zero reserve materials (e.g. tutorial_pricing, priv_zero_reserve).
+                base_prior = max(icost * 5.0, self._starting_capital * 0.025)
+                prior = base_prior * (0.85 + 1.3 * r_units) if num_finished > 1 else base_prior
+            elif num_finished > 1 and (c_max - c_min > 1e-6 or u_max > u_min):
                 r_cost = (icost - c_min) / max(1e-6, c_max - c_min)
-                r_units = (iunits - u_min) / max(1e-6, float(u_max - u_min))
                 r_tier = 0.72 * r_cost + 0.28 * r_units
                 prior = icost * (5.0 + 10.0 * (r_tier ** 1.2))
             else:
-                if icost < self._starting_capital * 0.002:
-                    prior = max(icost * 5.0, self._starting_capital * 0.025)
-                else:
-                    prior = icost * 5.0
+                prior = icost * 5.0
 
             observed = ctx.est_sale_price.get(g, 0.0)
             est[g] = observed if observed > icost * 1.2 else prior
@@ -529,34 +551,46 @@ class BiddingStrategy:
         free_after_all = max(0, lot_qty - d_high_scaled - d_mid_scaled)
         free_after_high = max(0, lot_qty - d_high_scaled)
 
+        # When reserve_price is 0.0 (e.g. priv_zero_reserve), anchor bidding to a small
+        # positive floor that scales up with market clearing prices / fill-rate feedback.
+        zero_reserve = rprice <= 1e-6
+        if zero_reserve:
+            eff_rprice = max(
+                0.35,
+                float(ctx.avg_material_cost.get(mat, 0.0)),
+                ms.last_bid_price if ms.ema_fill_rate < 0.85 else 0.0,
+            )
+        else:
+            eff_rprice = rprice
+
         # If the uncontested surplus in the lot already satisfies most of our need
         # (or in a single-good auction where uncontested units are abundant),
         # cap quantity to `free_after_all` and win 100% at the reserve price!
         if free_after_all >= net_qty:
             regime = 1
-            raw_price = rprice * 1.0012
+            raw_price = 0.05 if zero_reserve else rprice * 1.0012
             adj_qty = net_qty
         elif (
             len(goods_config.finished_goods) == 1
             and free_after_all >= max(2, int(net_qty * 0.65))
         ):
             regime = 1
-            raw_price = rprice * 1.0012
+            raw_price = 0.05 if zero_reserve else rprice * 1.0012
             adj_qty = free_after_all
         elif free_after_high >= net_qty:
             regime = 2
-            raw_price = rprice * ms.mid_mult
+            raw_price = eff_rprice * ms.mid_mult
             adj_qty = net_qty
         else:
             regime = 3
-            raw_price = rprice * ms.high_mult
+            raw_price = eff_rprice * ms.high_mult
             adj_qty = net_qty
 
         # On the final turn, avoid paying high-contest premiums.
         if remaining_turns == 1 and regime == 3 and len(goods_config.finished_goods) > 1:
             if free_after_high > 0:
                 regime = 2
-                raw_price = rprice * ms.mid_mult
+                raw_price = eff_rprice * ms.mid_mult
                 adj_qty = min(net_qty, free_after_high)
             else:
                 return -1.0, regime, 0
@@ -564,7 +598,8 @@ class BiddingStrategy:
         capped_price = min(raw_price, max_wtp)
         if capped_price < rprice:
             return -1.0, regime, 0
-        return max(rprice * 1.0005, capped_price), regime, adj_qty
+        min_valid = 0.01 if zero_reserve else rprice * 1.0005
+        return max(min_valid, capped_price), regime, adj_qty
 
     def _estimate_opponent_demand(
         self,
