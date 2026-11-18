@@ -49,6 +49,7 @@ class BiddingStrategy:
         self._initialized: bool = False
         self._starting_capital: float = 10000.0
         self._est_total_turns: int = 40
+        self._horizon_exceeded: bool = False
         self._materials: dict[str, _MaterialBidState] = {}
         self._recipes: dict[str, _RecipeTrackState] = {}
         self._init_team_capital: dict[str, float] = {}
@@ -68,13 +69,30 @@ class BiddingStrategy:
             self._update_from_turn_results(state, goods_config, ctx)
 
         if state.turn > self._est_total_turns:
-            # Scenario is longer than estimated: extend generously to exit endgame mode.
-            self._est_total_turns = state.turn + 15
+            # Scenario is longer than our initial guess (e.g. 240-turn extended market):
+            # disable speculative endgame brakes and extend horizon generously.
+            self._horizon_exceeded = True
+            self._est_total_turns = state.turn + 40
 
-        remaining_turns = max(1, self._est_total_turns - state.turn + 1)
+        remaining_turns = (
+            40 if self._horizon_exceeded else max(1, self._est_total_turns - state.turn + 1)
+        )
         if state.capital <= 1.0 or not state.auction_lots:
             self._record_pre_turn_state(state, goods_config, {})
             return []
+
+        # Hard capital-protection circuit breaker in micro-crowded negative-EV rooms
+        # (e.g. 40+ teams on tiny lots where 40/44 teams lose money): if our cash dipped
+        # below starting capital and we already hold finished goods, pause buying until
+        # existing stock converts back into cash.
+        if getattr(ctx, "is_micro_crowded", False):
+            total_fin_held = sum(
+                max(0, int(state.inventory.get(g, 0)))
+                for g in goods_config.finished_goods
+            )
+            if state.capital < self._starting_capital * 0.992 and total_fin_held >= 1:
+                self._record_pre_turn_state(state, goods_config, {})
+                return []
 
         # 1. Rank recipes by expected net margin and determine target batch quantities.
         recipe_targets, max_material_wtp = self._plan_recipe_material_targets(
@@ -171,6 +189,7 @@ class BiddingStrategy:
         ctx: MarketContext,
     ) -> None:
         self._initialized = True
+        self._horizon_exceeded = False
         self._starting_capital = max(1.0, float(state.capital))
 
         total_initial_lots = sum(max(0, int(lot.quantity)) for lot in state.auction_lots)
@@ -281,11 +300,11 @@ class BiddingStrategy:
                     )
                     if ms.last_regime == 2:
                         ms.mid_mult = min(
-                            1.70, ms.mid_mult + (0.04 if severe else 0.02)
+                            2.10, ms.mid_mult + (0.05 if severe else 0.025)
                         )
                     elif ms.last_regime == 3:
                         ms.high_mult = min(
-                            2.60, ms.high_mult + (0.08 if severe else 0.04)
+                            4.20, ms.high_mult + (0.12 if severe else 0.05)
                         )
                 elif fill_rate >= 0.99 and reserve_fell:
                     ms.demand_scale = max(0.70, ms.demand_scale * 0.92)
@@ -311,20 +330,10 @@ class BiddingStrategy:
             actual_produced = max(0, curr_fin + sold_qty - rt.prev_finished_inv)
             rt.ema_produced = 0.45 * actual_produced + 0.55 * rt.ema_produced
             rt.ema_sold = 0.45 * sold_qty + 0.55 * rt.ema_sold
-
-            leftover_sets = min(
-                (
-                    max(0, int(state.inventory.get(mat, 0))) // max(1, int(amt))
-                    for mat, amt in recipe.inputs.items()
-                ),
-                default=0,
-            )
-            if leftover_sets >= 1 and actual_produced <= 1 and curr_fin == 0:
-                # Only if shelf was empty and production still stopped at 1 is it a static 1-unit stub.
-                rt.inferred_prod_cap = max(1, actual_produced)
-                rt.is_hard_capped = True
-            elif actual_produced > 1:
-                rt.is_hard_capped = False
+            # Rely on `ctx.estimated_capacity_per_turn` instead of brittle per-recipe
+            # hard-cap heuristics that can permanently lock a recipe to 1 unit/turn.
+            rt.is_hard_capped = False
+            if actual_produced > 1:
                 rt.inferred_prod_cap = max(rt.inferred_prod_cap, actual_produced + 2)
 
     # ------------------------------------------------------------------
@@ -389,14 +398,16 @@ class BiddingStrategy:
         sales_count_map = getattr(ctx, "sales_count_by_good", {})
         crowding_map = getattr(ctx, "crowding_ratio_by_good", {})
         is_crowded = bool(getattr(ctx, "is_crowded_tournament", False))
+        is_micro_crowded = bool(getattr(ctx, "is_micro_crowded", False))
+        is_expansion = bool(getattr(ctx, "is_high_volume_expansion", False))
         is_blitz = bool(getattr(ctx, "is_blitz_window", False))
         est_cap = getattr(ctx, "estimated_capacity_per_turn", None)
         remaining_cap = int(est_cap) if est_cap is not None and est_cap > 0 else None
         covered_goods: set[str] = set()
 
-        # Identify top-2 highest-margin unique goods for calibrated early blitz targeting.
+        # Identify top-2 highest-margin unique goods for blitz / micro-crowded focus.
         blitz_top_goods: set[str] = set()
-        if is_blitz and num_finished > 1:
+        if (is_blitz or is_micro_crowded) and num_finished > 1:
             for m_val, rn in ranked_recipes:
                 if m_val <= 0.0:
                     continue
@@ -454,14 +465,21 @@ class BiddingStrategy:
             else:
                 # Multi-good market: align with `production.py` target shelf stocks & velocity.
                 crowding = float(crowding_map.get(g, 0.0))
-                if is_blitz and g in blitz_top_goods and unsold == 0:
+                if is_micro_crowded:
+                    # Micro-crowded negative-EV regime (e.g. 40+ teams on tiny lots):
+                    # protect capital! Only snipe tiny batches of top-2 uncrowded goods.
+                    if g not in blitz_top_goods or crowding > 0.35 or unsold >= 1 or curr_fin >= 2:
+                        desired_total = curr_fin
+                    else:
+                        desired_total = max(1, min(2, int(ceil(vel * 1.1 + 0.5))))
+                elif is_blitz and g in blitz_top_goods and unsold == 0:
                     # Calibrated early blitz: build strong monopoly batch on top-2 goods.
                     blitz_target = max(4, min(6, rt.inferred_prod_cap + 3))
                     desired_total = max(blitz_target, int(ceil(vel * 1.8 + 2.0)))
                 elif is_blitz and num_finished > 2 and g not in blitz_top_goods:
                     # During blitz, focus budget on top-2 high-tier goods; skip crowded low-tier.
                     desired_total = curr_fin
-                elif is_crowded and not is_blitz and crowding > 0.45 and (curr_fin > 0 or unsold >= 1):
+                elif is_crowded and not is_blitz and not is_expansion and crowding > 0.45 and (curr_fin > 0 or unsold >= 1):
                     # Red-ocean avoidance: stop buying materials for goods flooded by rivals.
                     desired_total = curr_fin
                 elif total_sold == 0:
@@ -474,12 +492,14 @@ class BiddingStrategy:
                 elif unsold == 1:
                     desired_total = max(1, int(ceil(vel * 0.95)))
                 elif stockouts >= 1:
+                    ramp_mult = 2.25 if is_expansion else 1.65
                     desired_total = max(
-                        int(ceil(vel * 1.65 + 1.5)),
-                        int(ceil(last_sold * 1.4 + 1.0)),
+                        int(ceil(vel * ramp_mult + (4.0 if is_expansion else 1.5))),
+                        int(ceil(last_sold * (1.75 if is_expansion else 1.4) + 1.0)),
                     )
                 else:
-                    desired_total = max(1, int(ceil(vel * 1.3 + 0.5)))
+                    flow_mult = 1.65 if is_expansion else 1.30
+                    desired_total = max(1, int(ceil(vel * flow_mult + (2.0 if is_expansion else 0.5))))
 
             # Endgame taper: never buy materials for more units than remaining turns can absorb.
             if remaining_turns <= 4:
@@ -711,9 +731,16 @@ class BiddingStrategy:
             return {}
 
         is_crowded = bool(getattr(ctx, "is_crowded_tournament", False))
+        is_micro_crowded = bool(getattr(ctx, "is_micro_crowded", False))
+        is_expansion = bool(getattr(ctx, "is_high_volume_expansion", False))
         is_blitz = bool(getattr(ctx, "is_blitz_window", False))
-        if is_blitz and state.turn <= 4:
+        if is_micro_crowded:
+            # Capital preservation in hyper-crowded tiny-lot rooms (e.g. 44-team default).
+            budget_share = 0.14
+        elif is_blitz and state.turn <= 4:
             budget_share = 0.85
+        elif is_expansion and remaining_turns > 3:
+            budget_share = 0.82
         elif remaining_turns > 2:
             budget_share = 0.78
         elif remaining_turns == 2:
@@ -723,7 +750,7 @@ class BiddingStrategy:
 
         # Post-blitz stop-loss in crowded tournament rooms: protect cash when shelf
         # inventory grows faster than sales velocity.
-        if is_crowded and not is_blitz and remaining_turns > 2:
+        if is_crowded and not is_blitz and not is_micro_crowded and remaining_turns > 2:
             total_fin_inv = sum(
                 max(0, int(state.inventory.get(g, 0)))
                 for g in goods_config.finished_goods

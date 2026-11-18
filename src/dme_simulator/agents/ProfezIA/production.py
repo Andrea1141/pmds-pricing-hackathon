@@ -168,9 +168,10 @@ class ProductionStrategy:
         team_count = max(1, ctx.active_competitor_count + 1)
         num_goods = max(1, len(goods_config.finished_goods))
 
-        # Market-scale baseline per finished good per team (adapts to default vs scaled_market).
+        # Market-scale baseline per finished good per team (adapts to default, scaled, and 240-turn).
         est_market_good_units = total_lot_units / max(1.0, avg_inputs * team_count * num_goods)
-        market_probe = max(2, min(40, ceil(est_market_good_units * 1.4)))
+        probe_cap = 250 if getattr(ctx, "is_high_volume_expansion", False) else 40
+        market_probe = max(2, min(probe_cap, ceil(est_market_good_units * 1.4)))
 
         # During a crowded-room blitz (Turns 1-6), identify the top 2 highest-margin goods
         # so blitz-won materials immediately convert into sellable monopoly units.

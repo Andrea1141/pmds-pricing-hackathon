@@ -44,6 +44,7 @@ class PricingStrategy:
         self._initialized: bool = False
         self._starting_capital: float = 10000.0
         self._est_total_turns: int = 40
+        self._horizon_exceeded: bool = False
         self._init_reserve: dict[str, float] = {}
         self._goods: dict[str, _GoodPricingState] = {}
         self._good_to_recipes: dict[str, list[str]] = {}
@@ -60,26 +61,24 @@ class PricingStrategy:
         else:
             self._update_from_turn_results(state, goods_config, ctx)
 
-        # Extend horizon to next standard checkpoint (20 -> 30 -> 40 -> 60 -> +20)
-        # if a scenario runs longer than initially estimated, and rebound anchors after a checkpoint.
+        # If a private scenario runs longer than our initial estimate (e.g. 240-turn
+        # extended market), rebound anchors once and disable speculative endgame discounts
+        # so we rely on inventory_cover pacing instead of firing fake endgame fire-sales.
         if state.turn > self._est_total_turns:
-            if self._est_total_turns <= 20:
-                self._est_total_turns = 30
-            elif self._est_total_turns <= 30:
-                self._est_total_turns = 40
-            elif self._est_total_turns <= 40:
-                self._est_total_turns = 60
-            else:
-                self._est_total_turns = state.turn + 20
-            for gp in self._goods.values():
-                if gp.has_ever_sold:
-                    gp.anchor_price = max(
-                        gp.anchor_price * 1.18,
-                        gp.ema_sold_price * 1.12,
-                        gp.max_sold_price * 0.94,
-                    )
+            if not self._horizon_exceeded:
+                for gp in self._goods.values():
+                    if gp.has_ever_sold:
+                        gp.anchor_price = max(
+                            gp.anchor_price * 1.18,
+                            gp.ema_sold_price * 1.12,
+                            gp.max_sold_price * 0.94,
+                        )
+            self._horizon_exceeded = True
+            self._est_total_turns = state.turn + 40
 
-        remaining_turns = max(1, self._est_total_turns - state.turn + 1)
+        remaining_turns = (
+            40 if self._horizon_exceeded else max(1, self._est_total_turns - state.turn + 1)
+        )
         min_prod, exp_prod, max_prod = self._estimate_current_production(
             state, goods_config, ctx
         )
@@ -87,8 +86,10 @@ class PricingStrategy:
         is_crowded = bool(
             getattr(ctx, "is_crowded_tournament", len(state.public_capital) >= 10)
         )
+        is_micro_crowded = bool(getattr(ctx, "is_micro_crowded", False))
+        is_expansion = bool(getattr(ctx, "is_high_volume_expansion", False))
         is_blitz = bool(
-            getattr(ctx, "is_blitz_window", is_crowded and state.turn <= 6)
+            getattr(ctx, "is_blitz_window", is_crowded and not is_micro_crowded and state.turn <= 6)
         )
         sellers_map = getattr(ctx, "competitor_sellers_by_good", {})
         crowding_map = getattr(ctx, "crowding_ratio_by_good", {})
@@ -153,6 +154,8 @@ class PricingStrategy:
                 comp_sellers=comp_sellers,
                 crowding=crowding,
                 is_crowded=is_crowded,
+                is_micro_crowded=is_micro_crowded,
+                is_expansion=is_expansion,
                 is_blitz=is_blitz,
                 base_anchor=base_anchor,
                 cost_floor=cost_floor,
@@ -182,6 +185,7 @@ class PricingStrategy:
         ctx: MarketContext | None = None,
     ) -> None:
         self._initialized = True
+        self._horizon_exceeded = False
         self._starting_capital = max(1.0, float(state.capital))
         self._init_reserve = {
             lot.good: max(0.0, float(lot.reserve_price))
@@ -520,6 +524,8 @@ class PricingStrategy:
         comp_sellers: int,
         crowding: float,
         is_crowded: bool,
+        is_micro_crowded: bool,
+        is_expansion: bool,
         is_blitz: bool,
         base_anchor: float,
         cost_floor: float,
@@ -584,23 +590,30 @@ class PricingStrategy:
             ]
 
         # Case 2: Multiple units available.
-        # Objective 2: When `is_crowded` is True, raise `max_steps` up to `min(active_qty, 20)`
-        # (1 unit per Listing on real stock) to maximize softmax shelf share against 30+ rivals.
+        # Dynamic Softmax Shelf-Space Scaling:
+        # In crowded tournament rooms (10-44 teams) and long high-volume markets (240 turns),
+        # splitting real inventory into 1-unit price-discriminating steps maximizes legitimate
+        # softmax shelf share against multi-listing rivals while staying well under 20 ms.
         active_qty = stock_to_plan
-        if is_crowded:
-            max_steps = min(active_qty, 20)
+        if is_expansion:
+            max_steps = min(active_qty, 50)
+        elif is_crowded:
+            max_steps = min(active_qty, 28)
         else:
             max_steps = 12 if num_goods == 1 else 8
         chunk = max(1, ceil(active_qty / max(1, max_steps)))
         tiers: list[tuple[int, float, str]] = []
 
-        # Objective 3: Include crowded-good clearance condition (`is_crowded and crowding >= 0.40 and curr_inv >= 2`).
-        crowded_clearance = is_crowded and (crowding >= 0.40 or comp_sellers >= 4) and curr_inv >= 2
+        crowded_clearance = (
+            (is_crowded and (crowding >= 0.40 or comp_sellers >= 4) and curr_inv >= 2)
+            or (is_micro_crowded and curr_inv >= 1)
+        )
         wide_multi_segment = (
             crowded_clearance
             or (num_goods == 1 and gp.init_endowment >= 10 and active_qty >= 4)
             or (active_qty >= 5 and comp_stock > 0)
             or (curr_inv >= 3 and inventory_cover > 2.0 and comp_stock > 0)
+            or (is_crowded and crowding >= 0.35 and curr_inv >= 1)
         )
 
         if ceiling > 0:

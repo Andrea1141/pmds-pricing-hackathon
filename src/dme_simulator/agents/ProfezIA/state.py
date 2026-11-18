@@ -77,7 +77,10 @@ class MarketContext:
     competitor_raw_inventory: dict[str, int] = field(default_factory=dict)
     competitor_sellers_by_good: dict[str, int] = field(default_factory=dict)
     crowding_ratio_by_good: dict[str, float] = field(default_factory=dict)
+    supply_per_team: float = 0.0
     is_crowded_tournament: bool = False
+    is_micro_crowded: bool = False
+    is_high_volume_expansion: bool = False
     is_blitz_window: bool = False
     lot_scarcity: dict[str, float] = field(default_factory=dict)
     rival_capital_delta: dict[str, float] = field(default_factory=dict)
@@ -379,8 +382,25 @@ class MarketContext:
         self.crowding_ratio_by_good = {
             g: comp_sellers[g] / denom_rivals for g in goods_config.finished_goods
         }
-        self.is_crowded_tournament = len(state.public_capital) >= 10
-        self.is_blitz_window = self.is_crowded_tournament and state.turn <= 6
+        total_teams = max(1, len(state.public_capital))
+        total_lot_units = sum(max(0, lot.quantity) for lot in state.auction_lots)
+        self.supply_per_team = total_lot_units / float(total_teams)
+
+        self.is_crowded_tournament = total_teams >= 10
+        # Micro-crowded negative-EV regime (e.g. 30-44 teams fighting over tiny lots):
+        # protect capital instead of overbidding into a red ocean.
+        self.is_micro_crowded = total_teams >= 16 and self.supply_per_team < 6.0
+        # High-volume / long-horizon compounding regime (e.g. scaled_market, 240-turn extended):
+        self.is_high_volume_expansion = (
+            (state.turn >= 12 and self.supply_per_team >= 12.0)
+            or self.supply_per_team >= 25.0
+        )
+        # Only run early blitz when crowded AND lots have enough supply per team to profit.
+        self.is_blitz_window = (
+            self.is_crowded_tournament
+            and not self.is_micro_crowded
+            and state.turn <= 6
+        )
         self.rival_capital_delta = rival_deltas
 
         # Track market demand heat from positive rival cash inflows + own sales velocity.
