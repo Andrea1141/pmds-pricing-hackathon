@@ -21,7 +21,9 @@ class _GoodPricingState:
 
     init_cost: float = 10.0
     input_units: int = 1
+    init_endowment: int = 0
     anchor_price: float = 100.0
+    price_ceiling: float = 0.0
     max_sold_price: float = 0.0
     ema_sold_price: float = 0.0
     ema_production: float = 1.0
@@ -35,7 +37,7 @@ class _GoodPricingState:
 
 
 class PricingStrategy:
-    """Adaptive multi-tier pricing with staircase WTP discovery and inventory pacing."""
+    """Adaptive multi-tier pricing with staircase WTP discovery and ceiling tracking."""
 
     def __init__(self) -> None:
         self._initialized: bool = False
@@ -58,7 +60,6 @@ class PricingStrategy:
             self._update_from_turn_results(state, goods_config, ctx)
 
         if state.turn >= self._est_total_turns:
-            # Smoothly extend horizon if private scenario is longer than expected.
             self._est_total_turns = state.turn + 2
 
         remaining_turns = max(1, self._est_total_turns - state.turn + 1)
@@ -82,11 +83,9 @@ class PricingStrategy:
                 unit_cost, gp, curr_inv, remaining_turns
             )
 
-            # Clamp anchor price to valid range above cost floor.
             base_anchor = max(cost_floor, gp.anchor_price)
-            if comp_stock == 0 and gp.has_ever_sold and remaining_turns > 3:
-                # Scarcity premium when competitors have zero finished stock of this good.
-                base_anchor = max(base_anchor, gp.ema_sold_price * 1.03)
+            if comp_stock == 0 and gp.has_ever_sold and remaining_turns > 3 and curr_inv == 0:
+                base_anchor = max(base_anchor, gp.ema_sold_price * 1.025)
 
             good_tiers = self._build_good_staircase(
                 good=good,
@@ -171,9 +170,7 @@ class PricingStrategy:
                 mult = 5.3 + 10.6 * (r_tier ** 1.2)
                 anchor = icost * mult
             else:
-                # Single-good or uniform-cost scenario.
                 if icost < self._starting_capital * 0.002:
-                    # Raw materials are nominal/nearly free (e.g. tutorial_pricing).
                     anchor = max(icost * 5.0, self._starting_capital * 0.0285)
                 else:
                     anchor = icost * 5.0
@@ -182,14 +179,16 @@ class PricingStrategy:
             self._goods[good] = _GoodPricingState(
                 init_cost=icost,
                 input_units=iunits,
+                init_endowment=init_inv,
                 anchor_price=max(icost * 1.25, anchor),
+                price_ceiling=0.0,
                 ema_production=1.0,
                 ema_sales=max(1.0, init_inv / 6.0) if init_inv > 0 else 1.0,
                 prev_inventory=init_inv,
             )
 
     # ------------------------------------------------------------------
-    # Turn-over-turn learning from realized sales & inventory conservation
+    # Turn-over-turn learning from realized sales & ceiling detection
     # ------------------------------------------------------------------
 
     def _update_from_turn_results(
@@ -217,6 +216,7 @@ class PricingStrategy:
 
         prev_remaining_turns = max(1, self._est_total_turns - (state.turn - 1) + 1)
         stock_horizon = min(float(prev_remaining_turns), 11.0)
+        num_goods = max(1, len(goods_config.finished_goods))
 
         for good in goods_config.finished_goods:
             gp = self._goods.get(good)
@@ -229,7 +229,6 @@ class PricingStrategy:
             curr_inv = max(0, int(state.inventory.get(good, 0)))
 
             # Exact Phase-3 available stock on turn t-1 by inventory conservation:
-            # inv_t = available_{t-1} - sold_{t-1}  =>  available_{t-1} = inv_t + sold_{t-1}
             actual_available = curr_inv + sold_qty
             actual_produced = max(0, actual_available - gp.prev_inventory)
 
@@ -242,26 +241,38 @@ class PricingStrategy:
             if actual_available <= 0:
                 continue
 
-            # Replay how many units were offered in active tiers vs holdback reserve.
+            # Replay how many units were actually offered at each price tier on turn t-1.
             rem = actual_available
             active_offered = 0
-            highest_offered_price = gp.anchor_price
+            offered_tiers: list[tuple[int, float, str]] = []
             for req_qty, tier_price, role in gp.prev_listings:
                 if rem <= 0:
                     break
                 off = min(rem, req_qty)
                 rem -= off
                 if off > 0:
-                    highest_offered_price = max(highest_offered_price, tier_price)
+                    offered_tiers.append((off, tier_price, role))
                     if role != "reserve":
                         active_offered += off
             active_offered = max(1, active_offered)
 
-            # Separate one-time stock amortization from recurring production flow.
-            target_velocity = max(
-                1.0,
-                (gp.prev_inventory / stock_horizon) + float(actual_produced),
+            is_endowment_good = (
+                num_goods == 1
+                and gp.init_endowment >= 10
+                and gp.ema_production <= 1.5
             )
+            if is_endowment_good:
+                target_velocity = max(
+                    1.0,
+                    (gp.prev_inventory / stock_horizon) + float(actual_produced),
+                )
+            else:
+                # Active production regime: must clear new production plus drain backlog.
+                target_velocity = max(
+                    1.0,
+                    float(actual_produced) + (gp.prev_inventory / min(float(prev_remaining_turns), 3.0)),
+                )
+
             curr_comp_stock = self._competitor_finished_stock(state, ctx, good)
             competitor_dumped = (
                 gp.prev_competitor_stock >= 12
@@ -273,6 +284,7 @@ class PricingStrategy:
                 gp.zero_sale_streak = 0
                 avg_tx_price = sold_rev / sold_qty
                 max_tx_price = max(p for _, p in tx_list)
+                min_tx_price = min(p for _, p in tx_list)
 
                 gp.max_sold_price = max(gp.max_sold_price * 0.995, max_tx_price)
                 if gp.ema_sold_price <= 0:
@@ -282,24 +294,42 @@ class PricingStrategy:
                         0.45 * avg_tx_price + 0.55 * gp.ema_sold_price
                     )
 
+                # Gently relax any existing ceiling over time so it never traps prices.
+                if gp.price_ceiling > 0:
+                    if max_tx_price >= gp.price_ceiling * 0.97:
+                        gp.price_ceiling = max_tx_price * 1.08
+                    else:
+                        gp.price_ceiling *= 1.015
+
+                # Only infer a tight upper WTP ceiling when a meaningful sample of customers
+                # (sold_qty >= 3) bought lower tiers while rejecting the next tier above.
+                if not competitor_dumped and sold_qty >= 3:
+                    failed_above = [
+                        tp
+                        for off_q, tp, role in offered_tiers
+                        if off_q > 0 and role != "reserve" and tp > max_tx_price * 1.005
+                    ]
+                    if failed_above:
+                        lowest_failed = min(failed_above)
+                        if gp.price_ceiling <= 0:
+                            gp.price_ceiling = lowest_failed
+                        else:
+                            gp.price_ceiling = min(
+                                gp.price_ceiling,
+                                0.35 * gp.price_ceiling + 0.65 * lowest_failed,
+                            )
+
                 sold_all_available = sold_qty >= actual_available
                 sold_all_active = sold_qty >= active_offered
                 met_velocity = sold_qty >= max(1, int(round(0.85 * target_velocity)))
 
                 if sold_all_available:
                     gp.sold_out_streak += 1
-                    if actual_available == 1:
-                        step_up = 1.07 if gp.sold_out_streak == 1 else 1.095
-                        gp.anchor_price = max(
-                            gp.anchor_price * 1.045,
-                            max_tx_price * step_up,
-                        )
-                    else:
-                        step_up = 1.075 if gp.sold_out_streak == 1 else 1.10
-                        gp.anchor_price = max(
-                            gp.anchor_price * 1.05,
-                            max_tx_price * step_up,
-                        )
+                    step_up = 1.07 if gp.sold_out_streak == 1 else 1.095
+                    new_anchor = max(gp.anchor_price * 1.045, max_tx_price * step_up)
+                    if gp.price_ceiling > 0:
+                        gp.price_ceiling = max(gp.price_ceiling, new_anchor * 1.06)
+                    gp.anchor_price = new_anchor
                 elif sold_all_active or (
                     met_velocity and max_tx_price >= gp.anchor_price * 0.99
                 ):
@@ -308,34 +338,36 @@ class PricingStrategy:
                         gp.anchor_price * 1.02,
                         0.40 * gp.anchor_price + 0.60 * max_tx_price * 1.025,
                     )
-                elif sold_qty < 0.60 * target_velocity and not competitor_dumped:
+                elif not is_endowment_good and curr_inv >= 5 and sold_qty < 0.70 * target_velocity:
+                    # Heavy backlog accumulating: ease anchor down to clear excess shelf stock.
                     gp.sold_out_streak = 0
-                    # Selling too slowly relative to stock+flow velocity: ease down.
+                    ref_price = 0.60 * avg_tx_price + 0.40 * min_tx_price
+                    gp.anchor_price = (0.50 * gp.anchor_price + 0.50 * ref_price) * 0.94
+                elif sold_qty < 0.55 * target_velocity and not competitor_dumped:
+                    gp.sold_out_streak = 0
                     gp.anchor_price = (
                         0.60 * gp.anchor_price + 0.40 * avg_tx_price
                     ) * 0.96
                 else:
                     gp.sold_out_streak = 0
-                    gp.anchor_price = (
-                        0.50 * gp.anchor_price + 0.50 * max_tx_price
-                    )
+                    target_ref = max_tx_price if sold_qty <= 2 else (0.50 * avg_tx_price + 0.50 * max_tx_price)
+                    if gp.price_ceiling > 0:
+                        target_ref = min(target_ref, gp.price_ceiling * 0.98)
+                    gp.anchor_price = 0.50 * gp.anchor_price + 0.50 * target_ref
             else:
                 # 0 units sold despite having positive stock in Phase 3.
                 gp.sold_out_streak = 0
                 if competitor_dumped:
-                    # Competitors dumped initial inventory at fire-sale prices; hold firm.
                     gp.anchor_price *= 0.99
                 else:
                     gp.zero_sale_streak += 1
                     if gp.has_ever_sold and gp.ema_sold_price > 0:
-                        # Pull back toward known working price range.
                         decay = 0.92 if gp.zero_sale_streak == 1 else 0.85
                         gp.anchor_price = min(
                             gp.anchor_price * decay,
                             0.50 * gp.anchor_price + 0.50 * gp.ema_sold_price,
                         )
                     else:
-                        # Fast downward discovery if initial prior exceeded market WTP.
                         if gp.zero_sale_streak == 1:
                             gp.anchor_price *= 0.84
                         elif gp.zero_sale_streak == 2:
@@ -362,70 +394,95 @@ class PricingStrategy:
     ) -> list[tuple[int, float, str]]:
         """Construct ascending price staircase `(qty, price, role)` for `good`."""
         stock_to_plan = max(1, expected_stock)
-        extra_buffer = max(2, optimistic_stock - stock_to_plan + 4)
-
-        # Endgame urgency factor: continuation value of unsold stock drops to 0 at turn T.
+        extra_buffer = max(2, optimistic_stock - stock_to_plan + 6)
         num_goods = max(1, len(self._goods))
+
         endgame_discount = 1.0
-        if remaining_turns == 3 and stock_to_plan > ceil(gp.ema_sales * 1.8):
-            endgame_discount = 0.92
+        if remaining_turns == 4 and curr_inv >= 3 and num_goods > 1:
+            endgame_discount = 0.93
+        elif remaining_turns == 3:
+            if stock_to_plan > ceil(gp.ema_sales * 1.6):
+                endgame_discount = 0.88
+            elif curr_inv >= 2 and num_goods > 1:
+                endgame_discount = 0.91
         elif remaining_turns == 2:
             if stock_to_plan > 1:
-                endgame_discount = 0.84
+                endgame_discount = 0.80 if num_goods > 1 else 0.85
             elif num_goods > 1:
-                endgame_discount = 0.91
+                endgame_discount = 0.88
         elif remaining_turns == 1:
             if num_goods > 1:
-                endgame_discount = 0.72 if stock_to_plan > 1 else 0.76
+                endgame_discount = 0.68 if stock_to_plan > 1 else 0.75
             else:
                 endgame_discount = 0.80 if stock_to_plan > 2 else 0.88
 
         anchor = max(cost_floor, base_anchor * endgame_discount)
         if remaining_turns == 1 and gp.ema_sold_price > 0 and num_goods > 1:
-            anchor = max(cost_floor, min(anchor, gp.ema_sold_price * 0.80))
+            anchor = max(cost_floor, min(anchor, gp.ema_sold_price * 0.78))
+
+        # Respect empirical price ceiling if one has been discovered.
+        ceiling = gp.price_ceiling if (gp.price_ceiling > cost_floor and remaining_turns > 1) else 0.0
+        if ceiling > 0 and anchor > ceiling * 0.97:
+            anchor = max(cost_floor, ceiling * 0.96)
 
         # Case 1: Only 1 expected unit available in Phase 3.
         if stock_to_plan == 1:
             if gp.zero_sale_streak >= 1:
-                first_price = max(cost_floor, anchor * 0.96)
+                first_price = max(cost_floor, anchor * 0.95)
             else:
                 first_price = anchor
-            probe_price = max(first_price * 1.06, anchor * 1.08)
+            probe_price = max(first_price * 1.04, anchor * 1.06)
+            if ceiling > 0:
+                probe_price = min(probe_price, ceiling * 1.01)
             return [
                 (1, first_price, "core"),
-                (extra_buffer, probe_price, "probe"),
+                (extra_buffer, max(first_price, probe_price), "probe"),
             ]
 
-        # Case 2: Multiple units available — compute active target vs reserve holdback.
-        stock_horizon = min(float(remaining_turns), 10.0)
+        # Case 2: Multiple units available.
+        is_endowment_good = (
+            num_goods == 1
+            and gp.init_endowment >= 10
+            and gp.ema_production <= 1.5
+        )
         est_flow = max(0, expected_stock - curr_inv)
-        if turn == 1 and comp_stock >= 15 and curr_inv >= 10:
-            # Competitors hold large initial stock and will dump on Turn 1;
-            # offer a tight top-tier staircase so any Turn-1 sales are high-margin
-            # while preserving inventory for Turn 2+ when competitors run dry.
-            active_qty = max(3, ceil(curr_inv / 6.0) + est_flow)
-        elif remaining_turns <= 3:
-            active_qty = stock_to_plan
+
+        if is_endowment_good and remaining_turns > 3:
+            stock_horizon = min(float(remaining_turns), 10.0)
+            if turn == 1 and comp_stock >= 15 and curr_inv >= 10:
+                active_qty = max(3, ceil(curr_inv / 6.0) + est_flow)
+            else:
+                target_active = ceil(
+                    curr_inv / stock_horizon + max(float(est_flow), gp.ema_production) + 0.5
+                )
+                active_qty = min(stock_to_plan, max(2, target_active))
         else:
-            target_active = ceil(curr_inv / stock_horizon + max(float(est_flow), gp.ema_production) + 0.5)
-            active_qty = min(stock_to_plan, max(2, target_active))
+            # In active production mode, offer 100% of expected stock in active tiers
+            # so produced units never sit blocked behind a synthetic holdback price!
+            active_qty = stock_to_plan
 
         holdback_qty = max(0, stock_to_plan - active_qty)
 
-        # Split active_qty into unit-sized (or small-chunk) steps on an ascending staircase.
-        # Each separate Listing gets its own offer column in the simulator's softmax
-        # AND causes customers within the turn to walk up the price steps as lower steps clear.
         max_steps = 10
         chunk = max(1, ceil(active_qty / max_steps))
         tiers: list[tuple[int, float, str]] = []
 
-        # Define price multipliers from entry step to upward discovery probe.
-        if not gp.has_ever_sold and turn == 1:
-            step_mults = [0.93, 0.98, 1.03, 1.08, 1.14, 1.22]
-        elif gp.zero_sale_streak >= 1:
-            step_mults = [0.90, 0.95, 1.00, 1.05]
+        if ceiling > 0:
+            # Ceiling is known: pack 85%+ of steps strictly below ceiling, with 1 top probe at ceiling.
+            if curr_inv >= 4 and not is_endowment_good:
+                step_mults = [0.88, 0.93, 0.96, 0.98, 1.00, 1.02]
+            else:
+                step_mults = [0.95, 0.97, 0.99, 1.00, 1.015, 1.03]
+        elif not gp.has_ever_sold and turn == 1:
+            if num_goods == 1 and gp.init_endowment == 0:
+                # Single-good production auction (e.g. tutorial_auction): tight band around 5x cost.
+                step_mults = [0.95, 0.97, 0.99, 1.01, 1.03, 1.06]
+            else:
+                step_mults = [0.93, 0.98, 1.03, 1.08, 1.14, 1.22]
+        elif gp.zero_sale_streak >= 1 or (curr_inv >= 5 and not is_endowment_good):
+            step_mults = [0.88, 0.93, 0.97, 1.01, 1.05]
         else:
-            step_mults = [0.97, 1.00, 1.03, 1.06, 1.10, 1.15]
+            step_mults = [0.96, 0.99, 1.02, 1.05, 1.09, 1.14]
 
         allocated = 0
         step_idx = 0
@@ -434,21 +491,28 @@ class PricingStrategy:
             frac = step_idx / max(1, len(step_mults) - 1)
             idx = min(step_idx, len(step_mults) - 1)
             mult = step_mults[idx] if step_idx < len(step_mults) else (
-                step_mults[-1] + 0.04 * (step_idx - len(step_mults) + 1)
+                step_mults[-1] + 0.025 * (step_idx - len(step_mults) + 1)
             )
             step_price = max(cost_floor, anchor * mult)
-            role = "core" if frac <= 0.65 else "upsell"
+            if ceiling > 0 and frac < 0.85:
+                step_price = max(cost_floor, min(step_price, ceiling * 0.985))
+            elif ceiling > 0:
+                step_price = max(cost_floor, min(step_price, ceiling * 1.015))
+            role = "core" if frac <= 0.70 else "upsell"
             tiers.append((qty, step_price, role))
             allocated += qty
             step_idx += 1
 
         top_active_price = tiers[-1][1] if tiers else anchor
         if holdback_qty > 0:
-            reserve_price = max(top_active_price * 1.06, anchor * 1.16)
+            reserve_price = max(top_active_price * 1.05, anchor * 1.14)
             tiers.append((holdback_qty, reserve_price, "reserve"))
             top_active_price = reserve_price
 
-        catchall_price = max(top_active_price * 1.04, anchor * 1.12)
+        if ceiling > 0:
+            catchall_price = max(cost_floor, min(top_active_price * 1.01, ceiling * 0.99))
+        else:
+            catchall_price = max(top_active_price * 1.03, anchor * 1.06)
         tiers.append((extra_buffer, catchall_price, "probe"))
         return tiers
 
@@ -462,7 +526,7 @@ class PricingStrategy:
         goods_config: GoodsConfig,
         ctx: MarketContext,
     ) -> tuple[dict[str, int], dict[str, int], dict[str, int]]:
-        """Simulate `ctx.planned_assembly` under 0%, 75%, and 100% bid fill rates."""
+        """Simulate `ctx.planned_assembly` under 0%, expected, and 100% bid fill rates."""
         lot_caps = {lot.good: max(0, int(lot.quantity)) for lot in state.auction_lots}
         bid_map: dict[str, int] = {}
         for bid in ctx.planned_bids:
@@ -470,9 +534,10 @@ class PricingStrategy:
                 cap = lot_caps.get(bid.good, bid.quantity)
                 bid_map[bid.good] = min(cap, bid_map.get(bid.good, 0) + int(bid.quantity))
 
+        fill_map = getattr(ctx, "auction_fill_rate", {})
         inv_min = {raw: max(0, int(state.inventory.get(raw, 0))) for raw in goods_config.raw_materials}
         inv_exp = {
-            raw: inv_min[raw] + int(round(0.75 * bid_map.get(raw, 0)))
+            raw: inv_min[raw] + int(round(fill_map.get(raw, 0.75) * bid_map.get(raw, 0)))
             for raw in goods_config.raw_materials
         }
         inv_max = {
@@ -480,10 +545,11 @@ class PricingStrategy:
             for raw in goods_config.raw_materials
         }
 
+        cap = getattr(ctx, "estimated_capacity_per_turn", None)
         return (
-            self._simulate_assembly(inv_min, goods_config, ctx),
-            self._simulate_assembly(inv_exp, goods_config, ctx),
-            self._simulate_assembly(inv_max, goods_config, ctx),
+            self._simulate_assembly(inv_min, goods_config, ctx, cap),
+            self._simulate_assembly(inv_exp, goods_config, ctx, cap),
+            self._simulate_assembly(inv_max, goods_config, ctx, cap),
         )
 
     @staticmethod
@@ -491,12 +557,16 @@ class PricingStrategy:
         raw_inv: dict[str, int],
         goods_config: GoodsConfig,
         ctx: MarketContext,
+        capacity_limit: int | None = None,
     ) -> dict[str, int]:
         produced: dict[str, int] = {good: 0 for good in goods_config.finished_goods}
         work_inv = dict(raw_inv)
+        rem_cap = capacity_limit
         for order in ctx.planned_assembly:
             if order.quantity <= 0 or order.recipe_name not in goods_config.recipes:
                 continue
+            if rem_cap is not None and rem_cap <= 0:
+                break
             recipe = goods_config.recipes[order.recipe_name]
             if not recipe.inputs:
                 continue
@@ -505,11 +575,15 @@ class PricingStrategy:
                 for mat, amt in recipe.inputs.items()
             )
             qty = min(int(order.quantity), max(0, buildable))
+            if rem_cap is not None:
+                qty = min(qty, rem_cap)
             if qty <= 0:
                 continue
             for mat, amt in recipe.inputs.items():
                 work_inv[mat] = work_inv.get(mat, 0) - int(amt) * qty
             produced[recipe.output_good] = produced.get(recipe.output_good, 0) + qty
+            if rem_cap is not None:
+                rem_cap -= qty
         return produced
 
     def _current_unit_cost(
@@ -541,10 +615,9 @@ class PricingStrategy:
         remaining_turns: int,
     ) -> float:
         if remaining_turns <= 1 and curr_inv > 0:
-            # Final turn: any cash recovered from existing inventory is pure gain.
-            return max(1.0, unit_cost * 0.70)
-        if remaining_turns == 2 and curr_inv > 2:
-            return max(1.0, unit_cost * 0.90)
+            return max(1.0, unit_cost * 0.65)
+        if remaining_turns == 2 and curr_inv >= 2:
+            return max(1.0, unit_cost * 0.85)
         return max(1.0, unit_cost * 1.12)
 
     @staticmethod
@@ -557,6 +630,5 @@ class PricingStrategy:
                 continue
             total += max(0, int(inv.get(good, 0)))
         if ctx.team_id is None:
-            # Fallback if team_id could not be uniquely inferred on turn 1.
             total = max(0, total - max(0, int(state.inventory.get(good, 0))))
         return total
