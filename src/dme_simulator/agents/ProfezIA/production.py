@@ -741,62 +741,56 @@ class ProductionStrategy:
         for r_name, qty in wave1_plan.items():
             if qty <= 0:
                 continue
-            recipe = recipes[r_name]
-            for mat, units in recipe.inputs.items():
-                rem_raw[mat] = max(0, rem_raw.get(mat, 0) - units * qty)
-            after_shelf[recipe.output_good] = after_shelf.get(recipe.output_good, 0) + qty
+            curr_inv = max(0, int(state.inventory.get(g, 0)))
+            already_planned = ctx.need_build.get(g, 0)
+            max_extra = max(
+                0,
+                min(6, ctx.target_stock.get(g, 2) + 2 - curr_inv - already_planned),
+            )
+            if max_extra > 0:
+                orders.append(AssemblyOrder(rname, int(max_extra)))
 
-        shadows: dict[str, float] = {}
-        for mat in goods_config.raw_materials:
-            baseline = ctx.material_shadow_value.get(mat, 0.0)
-            best_unlock = 0.0
-            for r_name, recipe in recipes.items():
-                req_mat = recipe.inputs.get(mat, 0)
-                if req_mat <= 0:
-                    continue
-                # Check if adding +1 unit of `mat` directly completes this recipe,
-                # or reduces its missing-input deficit.
-                missing_other = sum(
-                    max(0, u - rem_raw.get(m, 0))
-                    for m, u in recipe.inputs.items()
-                    if m != mat
+        # Simulate expected Phase-2 production from current raw stock + expected bid fills
+        # so `pricing.py` builds the price ladder over real expected units instead of unbacked targets.
+        lot_res = {lot.good: float(lot.reserve_price) for lot in state.auction_lots}
+        lot_caps = {lot.good: int(lot.quantity) for lot in state.auction_lots}
+        exp_raw = {m: max(0, int(state.inventory.get(m, 0))) for m in goods_config.raw_materials}
+        bid_map: dict[str, int] = {}
+        for bid in ctx.planned_bids:
+            if bid.quantity > 0 and bid.price_per_unit >= lot_res.get(bid.good, 0.0) - 1e-9:
+                bid_map[bid.good] = min(
+                    lot_caps.get(bid.good, bid.quantity),
+                    bid_map.get(bid.good, 0) + int(bid.quantity),
                 )
-                missing_self = max(0, req_mat - rem_raw.get(mat, 0))
-                util = self._marginal_utility(
-                    r_name,
-                    after_shelf.get(recipe.output_good, 0),
-                    goods_config,
-                    ctx,
-                    target_stock,
-                    recipe_rev,
-                    recipe_cost,
-                )
-                if util <= 0.0:
-                    continue
-                if missing_other == 0 and missing_self == 1:
-                    # Direct bottleneck: +1 unit immediately unlocks an entire finished good!
-                    best_unlock = max(best_unlock, util)
-                elif missing_self > 0:
-                    total_missing = missing_other + missing_self
-                    best_unlock = max(best_unlock, util / max(1, total_missing))
+        for m, bq in bid_map.items():
+            fill = ctx.auction_fill_rate.get(m, 0.65)
+            add_q = int(round(bq * fill))
+            if bq > 0 and add_q == 0 and fill >= 0.25:
+                add_q = 1
+            exp_raw[m] = exp_raw.get(m, 0) + add_q
 
-            # Blend direct bottleneck unlock with baseline economic value per unit.
-            if best_unlock > 0.0:
-                shadows[mat] = 0.65 * best_unlock + 0.35 * baseline
-            else:
-                # Non-bottleneck surplus material: discount baseline value.
-                shadows[mat] = 0.5 * baseline
-        ctx.material_shadow_value = shadows
-
-    @staticmethod
-    def _coalesce_orders(sequence: list[tuple[str, int]]) -> list[AssemblyOrder]:
-        """Merge consecutive identical recipe steps into compact `AssemblyOrder`s."""
-        orders: list[AssemblyOrder] = []
-        for r_name, qty in sequence:
+        expected_prod: dict[str, int] = {g: 0 for g in goods_config.finished_goods}
+        rem_cap = ctx.estimated_capacity_per_turn
+        recipes = goods_config.recipes
+        for order in orders:
+            if rem_cap is not None and rem_cap <= 0:
+                break
+            rec = recipes.get(order.recipe_name)
+            if rec is None or not rec.inputs or order.quantity <= 0:
+                continue
+            buildable = min(
+                exp_raw.get(m, 0) // max(1, int(u)) for m, u in rec.inputs.items()
+            )
+            qty = min(int(order.quantity), max(0, buildable))
+            if rem_cap is not None:
+                qty = min(qty, rem_cap)
             if qty <= 0:
                 continue
-            if orders and orders[-1].recipe_name == r_name:
-                orders[-1] = AssemblyOrder(r_name, orders[-1].quantity + qty)
-            else:
-                orders.append(AssemblyOrder(r_name, qty))
+            for m, u in rec.inputs.items():
+                exp_raw[m] -= int(u) * qty
+            expected_prod[rec.output_good] = expected_prod.get(rec.output_good, 0) + qty
+            if rem_cap is not None:
+                rem_cap -= qty
+        ctx.expected_produced = expected_prod
+
         return orders

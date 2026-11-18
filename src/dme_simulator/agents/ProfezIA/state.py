@@ -20,6 +20,9 @@ from dme_simulator.agents import (
 from dme_simulator.config import GoodsConfig
 
 
+_HORIZON_CHECKPOINTS = (20, 30, 40, 50, 60, 80, 100, 120, 150, 180, 200, 240)
+
+
 @dataclass
 class MarketContext:
     """Shared read-only market signals computed incrementally from observations."""
@@ -28,26 +31,29 @@ class MarketContext:
     prior_markup: float = 7.0
     single_good_prior_markup: float = 5.0
     costly_prior_markup: float = 4.5
-    explore_turns: int = 6
+    explore_turns: int = 5
     step_up: float = 0.07
-    step_down: float = 0.15
-    up_thresh: float = 0.90
-    min_markup: float = 1.30
+    step_down: float = 0.14
+    up_thresh: float = 0.96
+    min_markup: float = 1.18
     floor_patience: int = 3
-    floor_relax: float = 0.85
-    floor_min: float = 0.55
+    floor_relax: float = 0.92
+    floor_min: float = 0.95
 
     # --- Stock & opening parameters ---
     min_stock: int = 2
     max_stock: int = 200
-    cover_turns: float = 3.0
-    open_turns: int = 5
-    open_stock: int = 6
+    cover_turns: float = 2.6
+    open_turns: int = 2
+    open_stock: int = 4
 
     # --- Public turn state ---
     turn: int = 0
     team_id: str | None = None
     starting_capital: float = 12000.0
+    total_init_lots: int = 0
+    est_total_turns: int = 40
+    remaining_turns: int = 40
     nominal_reserve_regime: bool = False
     kits_affordable_at_reserve: float = 200.0
     single_good_market: bool = False
@@ -55,6 +61,7 @@ class MarketContext:
     is_hyper_crowded: bool = False
     proven_hot_market: bool = False
     open_active: bool = False
+    supply_per_team: float = 10.0
 
     # Incremental transaction slices
     new_auction_txs: list[AuctionResult] = field(default_factory=list)
@@ -73,6 +80,7 @@ class MarketContext:
     own_sold_prices_last_turn: dict[str, list[float]] = field(default_factory=dict)
     rival_sold_prices_last_turn: dict[str, list[float]] = field(default_factory=dict)
     rival_bid_prices_last_turn: dict[str, list[float]] = field(default_factory=dict)
+    auction_fill_rate: dict[str, float] = field(default_factory=dict)
 
     # Material cost & supplier lot tracking
     reserve_price: dict[str, float] = field(default_factory=dict)
@@ -112,14 +120,17 @@ class MarketContext:
     ranked_goods: list[str] = field(default_factory=list)
     target_stock: dict[str, int] = field(default_factory=dict)
     need_build: dict[str, int] = field(default_factory=dict)
+    expected_produced: dict[str, int] = field(default_factory=dict)
 
     # Internal previous-turn snapshots
     _prev_inventory: dict[str, int] | None = None
     _prev_public_inv: dict[str, dict[str, int]] = field(default_factory=dict)
+    _prev_bid_qty: dict[str, int] = field(default_factory=dict)
     _initialized: bool = False
 
     def update(self, state: Observation, goods_config: GoodsConfig) -> None:
         """Advance shared market state using the latest turn observation."""
+        prev_bids = self.planned_bids
         prev_assembly = self.planned_assembly
         self.turn = state.turn
         self.planned_bids = []
@@ -127,6 +138,15 @@ class MarketContext:
 
         if not self._initialized or state.turn == 1:
             self._reset_for_new_game(state, goods_config)
+
+        # Advance horizon along standard tournament checkpoints and rebound ref_price gently.
+        if state.turn > self.est_total_turns:
+            next_cp = next((cp for cp in _HORIZON_CHECKPOINTS if cp >= state.turn), None)
+            self.est_total_turns = next_cp if next_cp is not None else state.turn + 40
+            for g, r in list(self.ref_price.items()):
+                if self.total_sold.get(g, 0) > 0:
+                    self.ref_price[g] = r * 1.12
+        self.remaining_turns = max(1, self.est_total_turns - state.turn + 1)
 
         # 1. Slice only newly arrived transactions since last turn.
         self.new_auction_txs = state.auction_transactions[self._seen_auction_count :]
@@ -166,6 +186,16 @@ class MarketContext:
         self.rival_sold_prices_last_turn = rival_sold_prices
         self.rival_bid_prices_last_turn = rival_bids
 
+        # Track per-material auction fill-rate EMA from previous turn's valid bids.
+        prev_bid_qty: dict[str, int] = {}
+        for b in prev_bids:
+            if b.quantity > 0 and b.price_per_unit >= self.reserve_price.get(b.good, 0.0) - 1e-9:
+                prev_bid_qty[b.good] = prev_bid_qty.get(b.good, 0) + int(b.quantity)
+        for mat, req_q in prev_bid_qty.items():
+            obs_fill = min(1.0, own_won.get(mat, 0) / float(req_q))
+            prev_f = self.auction_fill_rate.get(mat, 0.65)
+            self.auction_fill_rate[mat] = 0.65 * prev_f + 0.35 * obs_fill
+
         # 4. Update material reserves, lot growth signals, and actual paid unit_cost EMA.
         lots = {lot.good: lot for lot in state.auction_lots}
         for raw in goods_config.raw_materials:
@@ -178,6 +208,7 @@ class MarketContext:
             else:
                 self.lot_growing[raw] = False
                 self.reserve_price.setdefault(raw, 1.0)
+            self.auction_fill_rate.setdefault(raw, 0.65)
 
             won_q = own_won.get(raw, 0)
             if won_q > 0:
@@ -201,6 +232,7 @@ class MarketContext:
 
         # 9. Compute unified target stocks, ranked profitable goods, and build needs.
         self._plan_targets_and_needs(state, goods_config)
+        self.expected_produced = {g: int(q) for g, q in self.need_build.items()}
 
         # 10. Save snapshots for next turn's delta calculations.
         self._prev_inventory = {k: int(v) for k, v in state.inventory.items()}
@@ -253,6 +285,17 @@ class MarketContext:
 
         lots = {lot.good: float(lot.reserve_price) for lot in state.auction_lots}
         total_init_lots = sum(max(0, int(lot.quantity)) for lot in state.auction_lots)
+        self.total_init_lots = total_init_lots
+        num_finished = max(1, len(goods_config.finished_goods))
+        if num_finished <= 2 and self.starting_capital <= 8000.0:
+            self.est_total_turns = 20
+        elif self.starting_capital >= 30000.0 or total_init_lots >= 500:
+            self.est_total_turns = 30
+        else:
+            self.est_total_turns = 40
+        self.remaining_turns = self.est_total_turns
+        self.auction_fill_rate.clear()
+        self.expected_produced.clear()
         recipe_res_costs: list[float] = []
         for recipe in goods_config.recipes.values():
             c = sum(lots.get(m, 0.0) * int(q) for m, q in recipe.inputs.items())
@@ -310,9 +353,12 @@ class MarketContext:
     def _is_mine(self, actor: str, price: float, my_prices: set[float]) -> bool:
         if self.team_id is not None:
             return actor == self.team_id
+        cands = self._id_candidates
+        if cands and actor not in cands:
+            return False
         if my_prices:
             return round(float(price), 4) in my_prices
-        return True
+        return len(cands) == 1 if cands else False
 
     # ------------------------------------------------------------------
     # Cost, capacity, rival signals
@@ -389,7 +435,10 @@ class MarketContext:
         goods_config: GoodsConfig,
         rival_sold_prices: dict[str, list[float]],
     ) -> None:
-        self.active_team_count = max(1, len(state.public_capital))
+        active_solvents = sum(1 for c in state.public_capital.values() if c >= 0.0)
+        self.active_team_count = max(1, active_solvents)
+        total_lot_units = sum(max(0, int(lot.quantity)) for lot in state.auction_lots)
+        self.supply_per_team = total_lot_units / float(self.active_team_count)
         mine = state.inventory
         prev_mine = self._prev_inventory or {}
         rival_stock: dict[str, int] = {}
@@ -459,9 +508,9 @@ class MarketContext:
                 if self.nominal_reserve_regime:
                     base_prior = max(cost * 5.0, self.starting_capital * 0.025)
                     scale = input_counts.get(g, 2) / max(1.0, avg_inputs)
-                    self.ref_price[g] = max(1.0, base_prior * (0.65 + 0.55 * scale))
+                    self.ref_price[g] = max(0.05, base_prior * (0.65 + 0.55 * scale))
                 else:
-                    self.ref_price[g] = max(1.0, cost * init_mult)
+                    self.ref_price[g] = max(0.05, cost * init_mult)
                 endow = self.init_endowment.get(g, 0)
                 self.sales_rate[g] = max(1.0, endow / 4.0) if endow >= 10 else 1.0
                 self.floor_mult[g] = self.min_markup
@@ -479,11 +528,11 @@ class MarketContext:
 
             # Fast censored-demand ramp on sellouts so we scale rapidly into demand waves.
             obs_demand = (
-                max(n_sold * 1.45, self.sales_rate[g] * 1.35)
+                n_sold * 1.25
                 if (actual_listed > 0 and n_sold >= actual_listed)
                 else float(n_sold)
             )
-            self.sales_rate[g] = 0.65 * self.sales_rate[g] + 0.35 * obs_demand
+            self.sales_rate[g] = 0.58 * self.sales_rate[g] + 0.42 * obs_demand
 
             fm = self.floor_mult.get(g, self.min_markup)
             if actual_listed > 0:
@@ -494,30 +543,30 @@ class MarketContext:
                     self.zero_streak[g] = self.zero_streak.get(g, 0) + 1
                     if (
                         self.zero_streak[g] >= self.floor_patience
-                        and self.ref_price[g] <= cost * fm * 1.03
+                        and self.ref_price[g] <= cost * fm * 1.05
                     ):
-                        fm = max(self.floor_min, fm * self.floor_relax)
+                        fm = max(0.85, fm * self.floor_relax)
             self.floor_mult[g] = fm
 
-            if self.zero_streak.get(g, 0) >= self.floor_patience + 2:
-                floor = max(0.05, cost * fm)
-            else:
-                floor = max(0.05, cost * fm, res_cost * 1.05)
+            floor = self.active_floor(g)
 
             if actual_listed > 0:
-                up = self.step_up * (2.0 if early else 1.0)
-                down = self.step_down * (1.5 if early else 1.0)
+                up = self.step_up * (1.8 if early else 1.0)
+                down = self.step_down * (1.3 if early else 1.0)
                 ref = self.ref_price[g]
+                sell_through = n_sold / float(max(1, actual_listed))
                 if n_sold >= actual_listed:
                     mono_bonus = 0.04 if self.rival_stock.get(g, 0) == 0 else 0.0
-                    ref *= 1.0 + 2.0 * up + mono_bonus
-                elif n_sold > 0 and sold[-1] >= ref * self.up_thresh:
+                    ref *= 1.0 + 1.8 * up + mono_bonus
+                elif n_sold > 0 and (sold[-1] >= ref * self.up_thresh or sell_through >= 0.68):
                     ref *= 1.0 + up
+                elif n_sold > 0 and sell_through >= 0.42:
+                    pass
                 elif n_sold > 0:
-                    ref *= 1.0 - 0.30 * down
+                    ref *= 1.0 - 0.35 * down
                 else:
                     if self.rival_sold.get(g, 0) > 0:
-                        ref *= 1.0 - min(0.32, 1.15 * down)
+                        ref *= 1.0 - min(0.28, 1.15 * down)
                     else:
                         ref *= 1.0 - down
 
@@ -525,9 +574,9 @@ class MarketContext:
                 if n_sold == 0 and r_prices:
                     top_rival = max(r_prices)
                     if self.total_sold[g] == 0:
-                        ref = max(floor, top_rival * 1.05)
+                        ref = max(floor, 0.5 * ref + 0.5 * top_rival * 1.05)
                     else:
-                        ref = min(ref, top_rival * 1.02)
+                        ref = min(ref, top_rival * 1.04)
 
                 self.ref_price[g] = max(ref, floor)
             else:
@@ -580,7 +629,7 @@ class MarketContext:
         stalled_early = (
             self.turn >= 2
             and self.tot_listed_last_turn >= 3
-            and self.overall_sell_through < 0.30
+            and self.overall_sell_through < 0.25
         )
         single_endowed = (
             self.single_good_market
@@ -597,17 +646,35 @@ class MarketContext:
             and not self.is_hyper_crowded
         )
 
-        base_stock = 1 if probe_only else (self.open_stock if self.open_active else self.min_stock)
+        is_crowded = self.active_team_count >= 10
+        cover = 1.8 if (is_crowded and self.supply_per_team < 12.0) else self.cover_turns
+        base_stock = (
+            (3 if is_crowded else self.open_stock)
+            if self.open_active
+            else (1 if is_crowded and self.supply_per_team < 12.0 else self.min_stock)
+        )
+        dyn_max_stock = max(self.max_stock, int(self.supply_per_team * 4.5))
+
+        taper_win = 2 if self.turn > 40 else 4
+        if self.remaining_turns <= taper_win:
+            cover = min(cover, max(0.75, float(self.remaining_turns) - 0.35))
+            if self.remaining_turns <= 2:
+                base_stock = 0
+
         target: dict[str, int] = {}
         for g in goods_config.finished_goods:
             curr_inv = max(0, int(state.inventory.get(g, 0)))
-            if self.zero_streak.get(g, 0) >= 3 and curr_inv >= 2:
+            if self.zero_streak.get(g, 0) >= 2 and curr_inv >= 2:
+                target[g] = curr_inv
+            elif self.remaining_turns == 1 and curr_inv > 0:
                 target[g] = curr_inv
             elif probe_only:
                 target[g] = 2
             else:
-                t = int(round(self.sales_rate.get(g, 1.0) * self.cover_turns)) + base_stock
-                target[g] = max(1, min(self.max_stock, t))
+                t = int(round(self.sales_rate.get(g, 1.0) * cover)) + base_stock
+                if self.remaining_turns == 1:
+                    t = min(t, max(1, int(round(self.sales_rate.get(g, 1.0) * 0.85))))
+                target[g] = max(1, min(dyn_max_stock, t))
 
         def good_priority(g: str) -> float:
             rec = goods_config.recipes[self.recipe_for[g]]
@@ -616,9 +683,9 @@ class MarketContext:
             if self.active_team_count >= 10:
                 holders = self.rival_holders.get(g, 0)
                 if holders == 0:
-                    margin_per_in *= 1.12
+                    margin_per_in *= 1.15
                 else:
-                    margin_per_in /= 1.0 + 0.025 * holders
+                    margin_per_in /= 1.0 + 0.03 * holders
             return margin_per_in
 
         ranked = sorted(
@@ -655,6 +722,11 @@ class MarketContext:
         cost = self.good_cost.get(good, 0.0)
         res_cost = self.good_reserve_cost.get(good, 0.0)
         fm = self.floor_mult.get(good, self.min_markup)
+        eg_win = 1 if self.turn > 40 else 2
+        if self.remaining_turns <= 1:
+            return max(0.02, cost * 0.50)
+        if self.remaining_turns <= eg_win:
+            return max(0.02, cost * 0.72)
         if self.zero_streak.get(good, 0) >= self.floor_patience + 2:
-            return max(0.05, cost * fm)
-        return max(0.05, cost * fm, res_cost * 1.05)
+            return max(0.02, cost * max(0.85, fm))
+        return max(0.02, cost * fm, res_cost * 1.03)
