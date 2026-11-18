@@ -75,9 +75,14 @@ class MarketContext:
     active_competitor_count: int = 0
     competitor_finished_inventory: dict[str, int] = field(default_factory=dict)
     competitor_raw_inventory: dict[str, int] = field(default_factory=dict)
+    competitor_sellers_by_good: dict[str, int] = field(default_factory=dict)
+    crowding_ratio_by_good: dict[str, float] = field(default_factory=dict)
+    is_crowded_tournament: bool = False
+    is_blitz_window: bool = False
     lot_scarcity: dict[str, float] = field(default_factory=dict)
     rival_capital_delta: dict[str, float] = field(default_factory=dict)
     market_demand_heat: float = 1.0
+    market_max_sale_price: dict[str, float] = field(default_factory=dict)
 
     # Downstream economic signals (populated in state.py and refined by production.py).
     recipe_margins: dict[str, float] = field(default_factory=dict)
@@ -137,12 +142,32 @@ class MarketContext:
             self.lot_scarcity[lot.good] = max(0.0, min(1.0, scarcity))
 
         # 4. Update running material cost & finished-good sale price estimates.
+        # Protect estimates from competitor noise when `observe_all_transactions=True`:
+        # prioritize own transactions; use rival transactions only as fallback/ceiling.
         alpha_price = 0.35
-        for tx in self.new_auction_txs:
+        own_auc_txs = (
+            [tx for tx in self.new_auction_txs if tx.buyer == self.team_id]
+            if self.team_id is not None
+            else self.new_auction_txs
+        )
+        auc_source = own_auc_txs if own_auc_txs else self.new_auction_txs
+        for tx in auc_source:
             prev = self.avg_material_cost.get(tx.good, tx.price)
-            self.avg_material_cost[tx.good] = (1.0 - alpha_price) * prev + alpha_price * tx.price
+            # When falling back to rival auction txs, blend gently so whale overbids
+            # don't distort our replacement cost.
+            w = alpha_price if own_auc_txs else 0.15
+            self.avg_material_cost[tx.good] = (1.0 - w) * prev + w * tx.price
 
         for sale in self.new_sales_txs:
+            if sale.price > self.market_max_sale_price.get(sale.good, 0.0):
+                self.market_max_sale_price[sale.good] = sale.price
+
+        own_sale_txs = (
+            [s for s in self.new_sales_txs if s.seller == self.team_id]
+            if self.team_id is not None
+            else self.new_sales_txs
+        )
+        for sale in own_sale_txs:
             prev = self.est_sale_price.get(sale.good, 0.0)
             if prev <= 0.0:
                 self.est_sale_price[sale.good] = sale.price
@@ -150,6 +175,20 @@ class MarketContext:
                 self.est_sale_price[sale.good] = (
                     (1.0 - alpha_price) * prev + alpha_price * sale.price
                 )
+        # If we have never sold `good` ourselves, seed `est_sale_price` from upper
+        # rival transaction prices (ignoring fire-sale dumps).
+        if self.team_id is not None:
+            rival_sales_by_good: dict[str, list[float]] = {}
+            for sale in self.new_sales_txs:
+                if sale.seller != self.team_id and sale.price > 0.0:
+                    rival_sales_by_good.setdefault(sale.good, []).append(sale.price)
+            for good, prices in rival_sales_by_good.items():
+                if self.sales_count_by_good.get(good, 0) == 0:
+                    prices.sort()
+                    # Use 75th percentile of rival sales as a clean cold-start signal.
+                    p75 = prices[int(0.75 * (len(prices) - 1))]
+                    prev = self.est_sale_price.get(good, 0.0)
+                    self.est_sale_price[good] = p75 if prev <= 0.0 else max(prev, 0.7 * prev + 0.3 * p75)
 
         # Ensure every raw material and finished good has a fallback key.
         for raw in goods_config.raw_materials:
@@ -307,6 +346,7 @@ class MarketContext:
     ) -> None:
         comp_finished = {g: 0 for g in goods_config.finished_goods}
         comp_raw = {m: 0 for m in goods_config.raw_materials}
+        comp_sellers = {g: 0 for g in goods_config.finished_goods}
         rival_deltas: dict[str, float] = {}
         active_rivals = 0
         positive_inflow = 0.0
@@ -324,13 +364,23 @@ class MarketContext:
                 if delta > 0.0:
                     positive_inflow += delta
             for g in goods_config.finished_goods:
-                comp_finished[g] += inv.get(g, 0)
+                q_g = inv.get(g, 0)
+                if q_g > 0:
+                    comp_finished[g] += q_g
+                    comp_sellers[g] += 1
             for m in goods_config.raw_materials:
                 comp_raw[m] += inv.get(m, 0)
 
         self.active_competitor_count = active_rivals
         self.competitor_finished_inventory = comp_finished
         self.competitor_raw_inventory = comp_raw
+        self.competitor_sellers_by_good = comp_sellers
+        denom_rivals = max(1, active_rivals)
+        self.crowding_ratio_by_good = {
+            g: comp_sellers[g] / denom_rivals for g in goods_config.finished_goods
+        }
+        self.is_crowded_tournament = len(state.public_capital) >= 10
+        self.is_blitz_window = self.is_crowded_tournament and state.turn <= 6
         self.rival_capital_delta = rival_deltas
 
         # Track market demand heat from positive rival cash inflows + own sales velocity.

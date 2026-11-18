@@ -172,6 +172,19 @@ class ProductionStrategy:
         est_market_good_units = total_lot_units / max(1.0, avg_inputs * team_count * num_goods)
         market_probe = max(2, min(40, ceil(est_market_good_units * 1.4)))
 
+        # During a crowded-room blitz (Turns 1-6), identify the top 2 highest-margin goods
+        # so blitz-won materials immediately convert into sellable monopoly units.
+        blitz_top_goods: set[str] = set()
+        if getattr(ctx, "is_blitz_window", False) and num_goods > 1:
+            good_best_margin: dict[str, float] = {}
+            for r_name, recipe in recipes.items():
+                m_val = ctx.recipe_margins.get(r_name, 0.0)
+                g = recipe.output_good
+                if g not in good_best_margin or m_val > good_best_margin[g]:
+                    good_best_margin[g] = m_val
+            ranked_g = sorted(good_best_margin, key=lambda g: -good_best_margin[g])
+            blitz_top_goods = set(ranked_g[: min(2, len(ranked_g))])
+
         targets: dict[str, int] = {}
         for good in goods_config.finished_goods:
             sold_count = ctx.sales_count_by_good.get(good, 0)
@@ -186,6 +199,8 @@ class ProductionStrategy:
                     targets[good] = 0
                 elif unsold == 1:
                     targets[good] = 1
+                elif good in blitz_top_goods:
+                    targets[good] = max(5, min(market_probe + 3, 8))
                 else:
                     targets[good] = max(1, min(market_probe, 4))
             elif stockouts >= 1:
@@ -199,7 +214,8 @@ class ProductionStrategy:
                 # Single unsold turn: hold steady around velocity without over-building.
                 targets[good] = max(1, ceil(vel * 1.0))
             else:
-                targets[good] = max(market_probe, ceil(vel * 1.45 + 1.0))
+                base_t = max(market_probe, ceil(vel * 1.45 + 1.0))
+                targets[good] = max(base_t, 6) if good in blitz_top_goods else base_t
         return targets
 
     def _compute_material_weights(
@@ -283,9 +299,21 @@ class ProductionStrategy:
         if unsold_streak >= 1:
             base_value *= 0.5 ** min(unsold_streak, 4)
 
-        # Modest boost when active competitors hold zero stock of this good.
-        if ctx.active_competitor_count > 0 and ctx.competitor_finished_inventory.get(good, 0) == 0:
-            base_value *= 1.15
+        # Crowding-aware niche routing: reward open niches and penalize crowded graveyards.
+        if ctx.active_competitor_count > 0:
+            sellers = ctx.competitor_sellers_by_good.get(
+                good, 0 if ctx.competitor_finished_inventory.get(good, 0) == 0 else 1
+            )
+            crowding = ctx.crowding_ratio_by_good.get(good, 0.0)
+            if ctx.active_competitor_count >= 8:
+                if sellers == 0:
+                    base_value *= 1.30
+                elif sellers == 1:
+                    base_value *= 1.15
+                elif crowding >= 0.40:
+                    base_value *= max(0.45, 1.0 - 0.50 * crowding)
+            elif ctx.competitor_finished_inventory.get(good, 0) == 0:
+                base_value *= 1.15
 
         # Diminishing returns beyond target_stock (prevents piling up saturated goods).
         target = target_stock.get(good, 2)

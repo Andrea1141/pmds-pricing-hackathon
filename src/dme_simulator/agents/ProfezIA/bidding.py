@@ -150,7 +150,7 @@ class BiddingStrategy:
 
         # 4. Enforce strict budget cap so random lot clearing order never starves key materials.
         final_bids = self._enforce_budget_cap(
-            planned_bids, state, goods_config, remaining_turns
+            planned_bids, state, goods_config, ctx, remaining_turns
         )
 
         self._record_pre_turn_state(state, goods_config, final_bids)
@@ -387,9 +387,23 @@ class BiddingStrategy:
         stockout_map = getattr(ctx, "own_stockout_streak", {})
         unsold_map = getattr(ctx, "own_unsold_streak", {})
         sales_count_map = getattr(ctx, "sales_count_by_good", {})
+        crowding_map = getattr(ctx, "crowding_ratio_by_good", {})
+        is_crowded = bool(getattr(ctx, "is_crowded_tournament", False))
+        is_blitz = bool(getattr(ctx, "is_blitz_window", False))
         est_cap = getattr(ctx, "estimated_capacity_per_turn", None)
         remaining_cap = int(est_cap) if est_cap is not None and est_cap > 0 else None
         covered_goods: set[str] = set()
+
+        # Identify top-2 highest-margin unique goods for calibrated early blitz targeting.
+        blitz_top_goods: set[str] = set()
+        if is_blitz and num_finished > 1:
+            for m_val, rn in ranked_recipes:
+                if m_val <= 0.0:
+                    continue
+                g_out = goods_config.recipes[rn].output_good
+                blitz_top_goods.add(g_out)
+                if len(blitz_top_goods) >= 2:
+                    break
 
         for margin, rname in ranked_recipes:
             recipe = goods_config.recipes[rname]
@@ -439,11 +453,22 @@ class BiddingStrategy:
                         desired_total = max(2, int(ceil(vel * 1.3 + 1.0)))
             else:
                 # Multi-good market: align with `production.py` target shelf stocks & velocity.
-                if total_sold == 0:
-                    if unsold >= 2 or curr_fin >= 3:
+                crowding = float(crowding_map.get(g, 0.0))
+                if is_blitz and g in blitz_top_goods and unsold == 0:
+                    # Calibrated early blitz: build strong monopoly batch on top-2 goods.
+                    blitz_target = max(4, min(6, rt.inferred_prod_cap + 3))
+                    desired_total = max(blitz_target, int(ceil(vel * 1.8 + 2.0)))
+                elif is_blitz and num_finished > 2 and g not in blitz_top_goods:
+                    # During blitz, focus budget on top-2 high-tier goods; skip crowded low-tier.
+                    desired_total = curr_fin
+                elif is_crowded and not is_blitz and crowding > 0.45 and (curr_fin > 0 or unsold >= 1):
+                    # Red-ocean avoidance: stop buying materials for goods flooded by rivals.
+                    desired_total = curr_fin
+                elif total_sold == 0:
+                    if unsold >= 2 or curr_fin >= max(3, rt.inferred_prod_cap):
                         desired_total = curr_fin
                     else:
-                        desired_total = max(2, min(4, rt.inferred_prod_cap))
+                        desired_total = max(2, min(10, rt.inferred_prod_cap))
                 elif unsold >= 2:
                     desired_total = max(0, int(vel * 0.6))
                 elif unsold == 1:
@@ -583,7 +608,13 @@ class BiddingStrategy:
             adj_qty = net_qty
         else:
             regime = 3
-            raw_price = eff_rprice * ms.high_mult
+            if getattr(ctx, "is_blitz_window", False):
+                # Calibrated early blitz: outbid cautious 1.3x-1.8x rivals on bottlenecks,
+                # while keeping strict economic discipline via `blitz_wtp_cap = 0.55`.
+                blitz_mult = max(ms.high_mult, 2.25)
+                raw_price = eff_rprice * blitz_mult
+            else:
+                raw_price = eff_rprice * ms.high_mult
             adj_qty = net_qty
 
         # On the final turn, avoid paying high-contest premiums.
@@ -595,7 +626,12 @@ class BiddingStrategy:
             else:
                 return -1.0, regime, 0
 
-        capped_price = min(raw_price, max_wtp)
+        eff_wtp_cap = (
+            max_wtp * 0.55
+            if getattr(ctx, "is_blitz_window", False) and regime == 3
+            else max_wtp
+        )
+        capped_price = min(raw_price, eff_wtp_cap)
         if capped_price < rprice:
             return -1.0, regime, 0
         min_valid = 0.01 if zero_reserve else rprice * 1.0005
@@ -667,13 +703,40 @@ class BiddingStrategy:
         planned_bids: dict[str, tuple[int, float, int, float]],
         state: Observation,
         goods_config: GoodsConfig,
+        ctx: MarketContext,
         remaining_turns: int,
     ) -> dict[str, tuple[int, float, int]]:
         """Ensure total auction commitment stays safely within `state.capital`."""
         if not planned_bids:
             return {}
 
-        budget_share = 0.78 if remaining_turns > 2 else (0.50 if remaining_turns == 2 else 0.30)
+        is_crowded = bool(getattr(ctx, "is_crowded_tournament", False))
+        is_blitz = bool(getattr(ctx, "is_blitz_window", False))
+        if is_blitz and state.turn <= 4:
+            budget_share = 0.85
+        elif remaining_turns > 2:
+            budget_share = 0.78
+        elif remaining_turns == 2:
+            budget_share = 0.50
+        else:
+            budget_share = 0.30
+
+        # Post-blitz stop-loss in crowded tournament rooms: protect cash when shelf
+        # inventory grows faster than sales velocity.
+        if is_crowded and not is_blitz and remaining_turns > 2:
+            total_fin_inv = sum(
+                max(0, int(state.inventory.get(g, 0)))
+                for g in goods_config.finished_goods
+            )
+            total_vel = sum(
+                float(getattr(ctx, "own_sold_ema", {}).get(g, 0.0))
+                for g in goods_config.finished_goods
+            )
+            if total_fin_inv > max(5, int(ceil(2.2 * total_vel))):
+                budget_share = min(budget_share, 0.35)
+            elif total_fin_inv > max(3, int(ceil(1.5 * total_vel))):
+                budget_share = min(budget_share, 0.52)
+
         max_budget = max(0.0, float(state.capital) * budget_share)
 
         total_cost = sum(qty * price for qty, price, _, _ in planned_bids.values())
